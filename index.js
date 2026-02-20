@@ -13,10 +13,11 @@
  *   - Avatar Cache:         In-memory blob URL caching for avatar images
  *   - Frame Optimizer:      Layout thrashing prevention, DOM read/write batching
  *   - Network Batcher:      GET request caching and deduplication
+ *   - Mobile Keyboard:      Prevents layout thrashing on virtual keyboard open/close
  *
  * Each module can be toggled independently from the extension settings panel.
  *
- * @version 2.0.0
+ * @version 2.1.0
  */
 
 const MODULE_NAME = 'SillyTavern-PerformanceOptimizer';
@@ -64,6 +65,9 @@ const DEFAULT_SETTINGS = {
     networkBatcher: {
         enabled: true,
     },
+    mobileKeyboard: {
+        enabled: true,
+    },
 };
 
 // ===================================================================
@@ -104,6 +108,8 @@ let avatarCache = null;
 let frameOptimizer = null;
 /** @type {import('./modules/network-batcher.js').NetworkBatcher|null} */
 let networkBatcher = null;
+/** @type {import('./modules/mobile-keyboard-optimizer.js').MobileKeyboardOptimizer|null} */
+let mobileKeyboard = null;
 
 // ===================================================================
 // Settings Management
@@ -168,7 +174,7 @@ async function safeImport(path) {
 async function initModules() {
     const [
         cssMod, settingsMod, domMod, scrollMod,
-        chatVirtMod, promptMod, bgMod, avatarMod, frameMod, netMod,
+        chatVirtMod, promptMod, bgMod, avatarMod, frameMod, netMod, mobileKbMod,
     ] = await Promise.all([
         safeImport('./modules/css-optimizer.js'),
         safeImport('./modules/settings-optimizer.js'),
@@ -180,6 +186,7 @@ async function initModules() {
         safeImport('./modules/avatar-cache.js'),
         safeImport('./modules/frame-optimizer.js'),
         safeImport('./modules/network-batcher.js'),
+        safeImport('./modules/mobile-keyboard-optimizer.js'),
     ]);
 
     if (cssMod?.CSSOptimizer) {
@@ -212,6 +219,9 @@ async function initModules() {
     if (netMod?.NetworkBatcher) {
         networkBatcher = new netMod.NetworkBatcher();
     }
+    if (mobileKbMod?.MobileKeyboardOptimizer) {
+        mobileKeyboard = new mobileKbMod.MobileKeyboardOptimizer();
+    }
 
     const loaded = [
         cssOptimizer && 'CSS',
@@ -224,6 +234,7 @@ async function initModules() {
         avatarCache && 'AvatarCache',
         frameOptimizer && 'FrameOpt',
         networkBatcher && 'NetBatch',
+        mobileKeyboard && 'MobileKB',
     ].filter(Boolean);
 
     console.log(`${LOG_PREFIX} Modules loaded: ${loaded.join(', ')}`);
@@ -332,6 +343,15 @@ function applyOptimizations() {
         }
     }
 
+    // Mobile Keyboard Optimizer
+    if (mobileKeyboard) {
+        if (settings.mobileKeyboard.enabled) {
+            mobileKeyboard.enable();
+        } else {
+            mobileKeyboard.disable();
+        }
+    }
+
     console.log(`${LOG_PREFIX} Optimizations applied.`);
 }
 
@@ -347,6 +367,7 @@ function disableAll() {
     avatarCache?.disable();
     frameOptimizer?.disable();
     networkBatcher?.disable();
+    mobileKeyboard?.disable();
 }
 
 // ===================================================================
@@ -503,6 +524,18 @@ function createSettingsPanel() {
                     <div class="perf-opt-subtitle">GET \uC694\uCCAD \uCE90\uC2F1 \uBC0F \uC911\uBCF5 \uC694\uCCAD \uC81C\uAC70\uB97C \uC218\uD589\uD569\uB2C8\uB2E4</div>
                 </div>
 
+
+                <!-- Mobile Keyboard Optimizer -->
+                <div class="perf-opt-section" id="perf_opt_mobilekb_section">
+                    <div class="perf-opt-toggle">
+                        <label for="perf_opt_mobilekb">
+                            <b>📱 모바일 키보드 최적화</b>
+                        </label>
+                        <input type="checkbox" id="perf_opt_mobilekb" ${checked(settings.mobileKeyboard.enabled)} />
+                    </div>
+                    <div class="perf-opt-subtitle">키보드 열기/닫기 시 레이아웃 재계산을 방지합니다</div>
+                </div>
+
                 <hr />
 
                 <!-- Status -->
@@ -643,6 +676,14 @@ function bindEvents() {
         updateStatus();
     });
 
+    // Mobile Keyboard Optimizer toggle
+    $('#perf_opt_mobilekb').on('change', function () {
+        getSettings().mobileKeyboard.enabled = this.checked;
+        saveSettings();
+        applyOptimizations();
+        updateStatus();
+    });
+
     // Apply button
     $('#perf_opt_apply').on('click', () => {
         applyOptimizations();
@@ -691,6 +732,7 @@ function syncUIFromSettings() {
     $('#perf_opt_avatar').prop('checked', s.avatarCache.enabled);
     $('#perf_opt_frame').prop('checked', s.frameOptimizer.enabled);
     $('#perf_opt_net').prop('checked', s.networkBatcher.enabled);
+    $('#perf_opt_mobilekb').prop('checked', s.mobileKeyboard.enabled);
 }
 
 /** Enable/disable section UI based on master toggle. */
@@ -707,6 +749,7 @@ function updateSectionStates() {
         '#perf_opt_avatar_section',
         '#perf_opt_frame_section',
         '#perf_opt_net_section',
+        '#perf_opt_mobilekb_section',
     ];
     for (const sel of sections) {
         if (enabled) {
@@ -745,6 +788,7 @@ function updateStatus() {
     if (settings.avatarCache.enabled) parts.push('\uC544\uBC14\uD0C0');
     if (settings.frameOptimizer.enabled) parts.push('\uD504\uB808\uC784');
     if (settings.networkBatcher.enabled) parts.push('\uB124\uD2B8\uC6CC\uD06C');
+    if (settings.mobileKeyboard.enabled) parts.push('\uBAA8\uBC14\uC77C\uD0A4\uBCF4\uB4DC');
 
     const text = parts.length > 0
         ? `\uC0C1\uD0DC: \uD65C\uC131\uD654 \u2014 ${parts.join(' | ')}`
