@@ -14,10 +14,12 @@
  *   - Frame Optimizer:      Layout thrashing prevention, DOM read/write batching
  *   - Network Batcher:      GET request caching and deduplication
  *   - Mobile Keyboard:      Prevents layout thrashing on virtual keyboard open/close
+ *   - Mobile Layout:        Stabilizes dvh/vh heights, CSS containment, GPU promotion
+ *   - Mobile Touch:         Input responsiveness, tap delay removal, scroll optimization
  *
  * Each module can be toggled independently from the extension settings panel.
  *
- * @version 2.1.0
+ * @version 3.0.0
  */
 
 const MODULE_NAME = 'SillyTavern-PerformanceOptimizer';
@@ -68,6 +70,12 @@ const DEFAULT_SETTINGS = {
     mobileKeyboard: {
         enabled: true,
     },
+    mobileLayout: {
+        enabled: true,
+    },
+    mobileTouch: {
+        enabled: true,
+    },
 };
 
 // ===================================================================
@@ -110,6 +118,10 @@ let frameOptimizer = null;
 let networkBatcher = null;
 /** @type {import('./modules/mobile-keyboard-optimizer.js').MobileKeyboardOptimizer|null} */
 let mobileKeyboard = null;
+/** @type {import('./modules/mobile-layout-stabilizer.js').MobileLayoutStabilizer|null} */
+let mobileLayout = null;
+/** @type {import('./modules/mobile-touch-optimizer.js').MobileTouchOptimizer|null} */
+let mobileTouch = null;
 
 // ===================================================================
 // Settings Management
@@ -174,7 +186,8 @@ async function safeImport(path) {
 async function initModules() {
     const [
         cssMod, settingsMod, domMod, scrollMod,
-        chatVirtMod, promptMod, bgMod, avatarMod, frameMod, netMod, mobileKbMod,
+        chatVirtMod, promptMod, bgMod, avatarMod, frameMod, netMod,
+        mobileKbMod, mobileLayoutMod, mobileTouchMod,
     ] = await Promise.all([
         safeImport('./modules/css-optimizer.js'),
         safeImport('./modules/settings-optimizer.js'),
@@ -187,6 +200,8 @@ async function initModules() {
         safeImport('./modules/frame-optimizer.js'),
         safeImport('./modules/network-batcher.js'),
         safeImport('./modules/mobile-keyboard-optimizer.js'),
+        safeImport('./modules/mobile-layout-stabilizer.js'),
+        safeImport('./modules/mobile-touch-optimizer.js'),
     ]);
 
     if (cssMod?.CSSOptimizer) {
@@ -222,6 +237,12 @@ async function initModules() {
     if (mobileKbMod?.MobileKeyboardOptimizer) {
         mobileKeyboard = new mobileKbMod.MobileKeyboardOptimizer();
     }
+    if (mobileLayoutMod?.MobileLayoutStabilizer) {
+        mobileLayout = new mobileLayoutMod.MobileLayoutStabilizer();
+    }
+    if (mobileTouchMod?.MobileTouchOptimizer) {
+        mobileTouch = new mobileTouchMod.MobileTouchOptimizer();
+    }
 
     const loaded = [
         cssOptimizer && 'CSS',
@@ -235,6 +256,8 @@ async function initModules() {
         frameOptimizer && 'FrameOpt',
         networkBatcher && 'NetBatch',
         mobileKeyboard && 'MobileKB',
+        mobileLayout && 'MobileLayout',
+        mobileTouch && 'MobileTouch',
     ].filter(Boolean);
 
     console.log(`${LOG_PREFIX} Modules loaded: ${loaded.join(', ')}`);
@@ -352,6 +375,24 @@ function applyOptimizations() {
         }
     }
 
+    // Mobile Layout Stabilizer
+    if (mobileLayout) {
+        if (settings.mobileLayout.enabled) {
+            mobileLayout.enable();
+        } else {
+            mobileLayout.disable();
+        }
+    }
+
+    // Mobile Touch Optimizer
+    if (mobileTouch) {
+        if (settings.mobileTouch.enabled) {
+            mobileTouch.enable();
+        } else {
+            mobileTouch.disable();
+        }
+    }
+
     console.log(`${LOG_PREFIX} Optimizations applied.`);
 }
 
@@ -368,6 +409,8 @@ function disableAll() {
     frameOptimizer?.disable();
     networkBatcher?.disable();
     mobileKeyboard?.disable();
+    mobileLayout?.disable();
+    mobileTouch?.disable();
 }
 
 // ===================================================================
@@ -536,6 +579,29 @@ function createSettingsPanel() {
                     <div class="perf-opt-subtitle">키보드 열기/닫기 시 레이아웃 재계산을 방지합니다</div>
                 </div>
 
+
+                <!-- Mobile Layout Stabilizer -->
+                <div class="perf-opt-section" id="perf_opt_mobilelayout_section">
+                    <div class="perf-opt-toggle">
+                        <label for="perf_opt_mobilelayout">
+                            <b>📐 모바일 레이아웃 안정화</b>
+                        </label>
+                        <input type="checkbox" id="perf_opt_mobilelayout" ${checked(settings.mobileLayout.enabled)} />
+                    </div>
+                    <div class="perf-opt-subtitle">dvh/vh 높이를 고정하여 키보드에 의한 레이아웃 재계산을 원천 차단합니다</div>
+                </div>
+
+                <!-- Mobile Touch Optimizer -->
+                <div class="perf-opt-section" id="perf_opt_mobiletouch_section">
+                    <div class="perf-opt-toggle">
+                        <label for="perf_opt_mobiletouch">
+                            <b>🤟 모바일 터치 최적화</b>
+                        </label>
+                        <input type="checkbox" id="perf_opt_mobiletouch" ${checked(settings.mobileTouch.enabled)} />
+                    </div>
+                    <div class="perf-opt-subtitle">탭 딜레이 제거, 스크롤 최적화, 입력 반응성을 개선합니다</div>
+                </div>
+
                 <hr />
 
                 <!-- Status -->
@@ -684,6 +750,22 @@ function bindEvents() {
         updateStatus();
     });
 
+    // Mobile Layout Stabilizer toggle
+    $('#perf_opt_mobilelayout').on('change', function () {
+        getSettings().mobileLayout.enabled = this.checked;
+        saveSettings();
+        applyOptimizations();
+        updateStatus();
+    });
+
+    // Mobile Touch Optimizer toggle
+    $('#perf_opt_mobiletouch').on('change', function () {
+        getSettings().mobileTouch.enabled = this.checked;
+        saveSettings();
+        applyOptimizations();
+        updateStatus();
+    });
+
     // Apply button
     $('#perf_opt_apply').on('click', () => {
         applyOptimizations();
@@ -733,6 +815,8 @@ function syncUIFromSettings() {
     $('#perf_opt_frame').prop('checked', s.frameOptimizer.enabled);
     $('#perf_opt_net').prop('checked', s.networkBatcher.enabled);
     $('#perf_opt_mobilekb').prop('checked', s.mobileKeyboard.enabled);
+    $('#perf_opt_mobilelayout').prop('checked', s.mobileLayout.enabled);
+    $('#perf_opt_mobiletouch').prop('checked', s.mobileTouch.enabled);
 }
 
 /** Enable/disable section UI based on master toggle. */
@@ -750,6 +834,8 @@ function updateSectionStates() {
         '#perf_opt_frame_section',
         '#perf_opt_net_section',
         '#perf_opt_mobilekb_section',
+        '#perf_opt_mobilelayout_section',
+        '#perf_opt_mobiletouch_section',
     ];
     for (const sel of sections) {
         if (enabled) {
@@ -789,6 +875,8 @@ function updateStatus() {
     if (settings.frameOptimizer.enabled) parts.push('\uD504\uB808\uC784');
     if (settings.networkBatcher.enabled) parts.push('\uB124\uD2B8\uC6CC\uD06C');
     if (settings.mobileKeyboard.enabled) parts.push('\uBAA8\uBC14\uC77C\uD0A4\uBCF4\uB4DC');
+    if (settings.mobileLayout.enabled) parts.push('\uBAA8\uBC14\uC77C\uB808\uC774\uC544\uC6C3');
+    if (settings.mobileTouch.enabled) parts.push('\uBAA8\uBC14\uC77C\uD130\uCE58');
 
     const text = parts.length > 0
         ? `\uC0C1\uD0DC: \uD65C\uC131\uD654 \u2014 ${parts.join(' | ')}`

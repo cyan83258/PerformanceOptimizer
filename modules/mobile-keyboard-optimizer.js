@@ -1,441 +1,331 @@
 /**
- * Mobile Keyboard Optimizer Module
+ * Mobile Keyboard Optimizer Module (v2 - Rewritten)
  *
- * On mobile devices, opening/closing the virtual keyboard causes the viewport
- * to resize, which triggers:
- *   1. All dvh/vh-based heights to recalculate (100dvh changes)
- *   2. position:fixed elements to reposition
- *   3. Backdrop-filter blur to re-render on resized elements
- *   4. Chat container to reflow all visible messages
- *   5. Background image to resize
+ * ROOT CAUSE: On mobile, opening/closing the virtual keyboard resizes the
+ * viewport, which triggers massive layout recalculation across all elements
+ * using dvh/vh units, position:fixed, and backdrop-filter.
  *
- * This module fixes the lag by:
- *   - Detecting keyboard open/close via visualViewport API
- *   - Freezing layout-critical CSS properties during keyboard transitions
- *   - Preventing scroll jumps during viewport resize
- *   - Setting CSS custom property --stable-vh for stable height reference
- *   - Temporarily disabling transitions/animations during keyboard events
- *   - Suppressing unnecessary resize handlers during keyboard show/hide
+ * This module:
+ *   1. Detects keyboard open/close via visualViewport API
+ *   2. Applies targeted CSS freeze on SPECIFIC elements (not * selector)
+ *   3. Suppresses resize events during keyboard transition
+ *   4. Preserves chat scroll position across keyboard transitions
+ *   5. Publishes keyboard state for other modules to consume
+ *
+ * Cooperates with:
+ *   - MobileLayoutStabilizer (handles dvh replacement)
+ *   - MobileTouchOptimizer (handles input UX)
  */
 
-const LOG = '[PerfOptimizer/MobileKB]';
-const STYLE_ID = 'perf-optimizer-mobile-kb-css';
-const FREEZE_STYLE_ID = 'perf-optimizer-mobile-kb-freeze';
+const LOG = '[PerfOpt/MobileKB]';
+const FREEZE_ID = 'perf-opt-kb-freeze';
+
+/** @typedef {'closed'|'opening'|'open'|'closing'} KeyboardState */
 
 export class MobileKeyboardOptimizer {
     constructor() {
-        /** @type {boolean} */
         this.active = false;
-        /** @type {boolean} */
-        this._keyboardVisible = false;
-        /** @type {number} Height before keyboard opened */
-        this._stableViewportHeight = 0;
-        /** @type {number} Width (stable, doesn't change with keyboard) */
-        this._stableViewportWidth = 0;
-        /** @type {Function|null} */
-        this._viewportHandler = null;
-        /** @type {Function|null} */
-        this._focusHandler = null;
-        /** @type {Function|null} */
-        this._blurHandler = null;
-        /** @type {Function|null} */
-        this._resizeHandler = null;
-        /** @type {number|null} */
+
+        /** @type {KeyboardState} */
+        this.state = 'closed';
+
+        /** @type {number} Full viewport height (no keyboard) */
+        this._fullHeight = 0;
+
+        /** @type {number} Current keyboard height estimate */
+        this.keyboardHeight = 0;
+
+        /** @type {Set<Function>} Subscribers to keyboard state changes */
+        this._listeners = new Set();
+
+        // Bound handlers for cleanup
+        this._onVVResize = null;
+        this._onResizeCapture = null;
+        this._rafId = null;
         this._unfreezeTimer = null;
-        /** @type {number|null} */
-        this._scrollRestoreTimer = null;
+        this._chatScrollPos = 0;
+
         /** @type {HTMLStyleElement|null} */
-        this._baseStyleEl = null;
-        /** @type {HTMLStyleElement|null} */
-        this._freezeStyleEl = null;
+        this._freezeEl = null;
     }
 
-    /** Enable mobile keyboard optimizations. */
+    // ── Public API ──────────────────────────────────────────────────
+
     enable() {
-        // Only activate on mobile/touch devices
-        if (!this._isMobileDevice()) {
-            console.log(`${LOG} Not a mobile device, skipping`);
+        if (this.active) return;
+        if (!this._isMobile()) {
+            console.log(`${LOG} Desktop detected, skipping`);
             return;
         }
 
-        this._stableViewportHeight = window.visualViewport?.height || window.innerHeight;
-        this._stableViewportWidth = window.visualViewport?.width || window.innerWidth;
-
-        this._injectBaseCSS();
-        this._setupVisualViewportListener();
-        this._setupFocusListeners();
-        this._setupResizeGuard();
-        this._setStableVH();
+        this._fullHeight = window.visualViewport?.height ?? window.innerHeight;
+        this._bindVisualViewport();
+        this._bindResizeGuard();
 
         this.active = true;
-        console.log(`${LOG} Enabled (viewport: ${this._stableViewportWidth}x${this._stableViewportHeight})`);
+        console.log(`${LOG} Enabled (viewport ${this._fullHeight}px)`);
     }
 
-    /** Disable and clean up. */
     disable() {
-        this._removeVisualViewportListener();
-        this._removeFocusListeners();
-        this._removeResizeGuard();
-
-        if (this._baseStyleEl) {
-            this._baseStyleEl.remove();
-            this._baseStyleEl = null;
-        }
-        this._unfreeze();
-
-        if (this._unfreezeTimer) {
-            clearTimeout(this._unfreezeTimer);
-            this._unfreezeTimer = null;
-        }
-        if (this._scrollRestoreTimer) {
-            clearTimeout(this._scrollRestoreTimer);
-            this._scrollRestoreTimer = null;
-        }
-
-        // Remove CSS custom property
-        document.documentElement.style.removeProperty('--stable-vh');
-        document.documentElement.style.removeProperty('--stable-viewport-height');
-        document.documentElement.style.removeProperty('--keyboard-offset');
-
+        if (!this.active) return;
+        this._unbindVisualViewport();
+        this._unbindResizeGuard();
+        this._clearTimers();
+        this._removeFreezeCSS();
+        this.state = 'closed';
+        this.keyboardHeight = 0;
         this.active = false;
     }
 
-    // ---------------------------------------------------------------
-    // Device Detection
-    // ---------------------------------------------------------------
+    /** Subscribe to keyboard state changes. Returns unsubscribe function. */
+    onStateChange(fn) {
+        this._listeners.add(fn);
+        return () => this._listeners.delete(fn);
+    }
+
+    /** @returns {boolean} */
+    get isKeyboardVisible() {
+        return this.state === 'open' || this.state === 'opening';
+    }
+
+    // ── Device Detection ────────────────────────────────────────────
 
     /** @private */
-    _isMobileDevice() {
+    _isMobile() {
         return (
             'ontouchstart' in window ||
             navigator.maxTouchPoints > 0 ||
-            window.innerWidth <= 1000 || // SillyTavern's mobile breakpoint
+            window.innerWidth <= 1000 ||
             /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
         );
     }
 
-    // ---------------------------------------------------------------
-    // Stable Viewport Height
-    // ---------------------------------------------------------------
-
-    /** @private Set --stable-vh CSS custom property */
-    _setStableVH() {
-        const vh = this._stableViewportHeight * 0.01;
-        document.documentElement.style.setProperty('--stable-vh', `${vh}px`);
-        document.documentElement.style.setProperty('--stable-viewport-height', `${this._stableViewportHeight}px`);
-        document.documentElement.style.setProperty('--keyboard-offset', '0px');
-    }
-
-    // ---------------------------------------------------------------
-    // Base CSS Injection
-    // ---------------------------------------------------------------
-
-    /** @private Inject always-active mobile CSS optimizations */
-    _injectBaseCSS() {
-        if (this._baseStyleEl) this._baseStyleEl.remove();
-
-        this._baseStyleEl = document.createElement('style');
-        this._baseStyleEl.id = STYLE_ID;
-        this._baseStyleEl.textContent = `
-/* [Performance Optimizer] Mobile Keyboard - Base Optimizations */
-
-/* Use GPU-accelerated transforms for send_form positioning */
-#send_form {
-    will-change: transform;
-    transform: translateZ(0);
-}
-
-/* Prevent browser auto-scroll on input focus */
-#send_textarea {
-    scroll-margin-bottom: 0px;
-}
-
-/* Optimize chat container for mobile scroll */
-#chat {
-    will-change: scroll-position;
-    -webkit-overflow-scrolling: touch;
-}
-
-/* Stable height: prevent #sheld and backgrounds from resizing with keyboard */
-@media screen and (max-width: 1000px) {
-    #bg1,
-    #bg_custom {
-        height: var(--stable-viewport-height, 100dvh) !important;
-    }
-}`;
-        document.head.appendChild(this._baseStyleEl);
-    }
-
-    // ---------------------------------------------------------------
-    // Freeze/Unfreeze During Keyboard Transition
-    // ---------------------------------------------------------------
-
-    /**
-     * @private
-     * Freeze the layout during keyboard open/close transition.
-     * Temporarily disables transitions, animations, and layout-triggering updates.
-     */
-    _freeze() {
-        if (this._freezeStyleEl) return;
-
-        this._freezeStyleEl = document.createElement('style');
-        this._freezeStyleEl.id = FREEZE_STYLE_ID;
-        this._freezeStyleEl.textContent = `
-/* [Performance Optimizer] Mobile Keyboard - Freeze During Transition */
-
-/* Kill ALL transitions and animations during keyboard resize */
-*, *::before, *::after {
-    transition-duration: 0s !important;
-    transition-delay: 0s !important;
-    animation-duration: 0s !important;
-    animation-delay: 0s !important;
-}
-
-/* Prevent backdrop-filter recalculation during resize */
-#send_form,
-.drawer-content,
-#top-bar,
-#top-settings-holder,
-.popup,
-.popup-content {
-    backdrop-filter: none !important;
-    -webkit-backdrop-filter: none !important;
-}
-
-/* Prevent background resize during keyboard show/hide */
-#bg1, #bg_custom {
-    transition: none !important;
-}`;
-        document.head.appendChild(this._freezeStyleEl);
-    }
-
-    /** @private Remove the freeze stylesheet */
-    _unfreeze() {
-        if (this._freezeStyleEl) {
-            this._freezeStyleEl.remove();
-            this._freezeStyleEl = null;
-        }
-    }
-
-    // ---------------------------------------------------------------
-    // VisualViewport API Listener
-    // ---------------------------------------------------------------
+    // ── VisualViewport Listener ─────────────────────────────────────
 
     /** @private */
-    _setupVisualViewportListener() {
-        if (!window.visualViewport) return;
-
-        this._viewportHandler = () => {
-            this._handleViewportChange();
-        };
-
-        window.visualViewport.addEventListener('resize', this._viewportHandler, { passive: true });
-    }
-
-    /** @private */
-    _removeVisualViewportListener() {
-        if (this._viewportHandler && window.visualViewport) {
-            window.visualViewport.removeEventListener('resize', this._viewportHandler);
-            this._viewportHandler = null;
-        }
-    }
-
-    /**
-     * @private
-     * Handle viewport size changes (keyboard open/close).
-     */
-    _handleViewportChange() {
+    _bindVisualViewport() {
         const vv = window.visualViewport;
         if (!vv) return;
 
-        const currentHeight = vv.height;
-        const heightDiff = this._stableViewportHeight - currentHeight;
-        const isKeyboard = heightDiff > 100; // >100px diff = keyboard
+        // Use a single rAF-throttled handler for minimum overhead
+        this._onVVResize = () => {
+            if (this._rafId) return; // Already scheduled
+            this._rafId = requestAnimationFrame(() => {
+                this._rafId = null;
+                this._processViewportChange();
+            });
+        };
 
-        if (isKeyboard && !this._keyboardVisible) {
-            // Keyboard opening
-            this._onKeyboardOpen(heightDiff);
-        } else if (!isKeyboard && this._keyboardVisible) {
-            // Keyboard closing
-            this._onKeyboardClose();
+        vv.addEventListener('resize', this._onVVResize, { passive: true });
+    }
+
+    /** @private */
+    _unbindVisualViewport() {
+        if (this._onVVResize) {
+            window.visualViewport?.removeEventListener('resize', this._onVVResize);
+            this._onVVResize = null;
         }
+        if (this._rafId) {
+            cancelAnimationFrame(this._rafId);
+            this._rafId = null;
+        }
+    }
 
-        // Update keyboard offset for CSS
+    // ── Viewport Change Processing ──────────────────────────────────
+
+    /** @private */
+    _processViewportChange() {
+        const vv = window.visualViewport;
+        if (!vv) return;
+
+        const current = vv.height;
+        const diff = this._fullHeight - current;
+        const kbThreshold = 100; // Keyboard is >100px
+
+        if (diff > kbThreshold) {
+            // Keyboard is visible
+            this.keyboardHeight = diff;
+
+            if (this.state === 'closed') {
+                this._onKeyboardOpening();
+            } else if (this.state === 'opening') {
+                // Still animating — update height, keep freeze
+                this._updateKeyboardOffset();
+            }
+            // If already 'open', just update offset silently
+            if (this.state === 'open') {
+                this._updateKeyboardOffset();
+            }
+        } else {
+            // Keyboard is hidden
+            if (this.state === 'open' || this.state === 'opening') {
+                this._onKeyboardClosing();
+            }
+        }
+    }
+
+    /** @private */
+    _onKeyboardOpening() {
+        this._saveScrollPos();
+        this._setState('opening');
+        this._injectFreezeCSS();
+        this._updateKeyboardOffset();
+
+        // Transition to 'open' after animation settles
+        this._scheduleUnfreeze(280, () => {
+            this._restoreScrollPos();
+            this._setState('open');
+        });
+    }
+
+    /** @private */
+    _onKeyboardClosing() {
+        this._saveScrollPos();
+        this._setState('closing');
+        this._injectFreezeCSS();
+
+        // Update full height (orientation might have changed while kb was open)
+        this._scheduleUnfreeze(280, () => {
+            this._fullHeight = window.visualViewport?.height ?? window.innerHeight;
+            this.keyboardHeight = 0;
+            this._updateKeyboardOffset();
+            this._restoreScrollPos();
+            this._setState('closed');
+        });
+    }
+
+    /** @private */
+    _setState(newState) {
+        if (this.state === newState) return;
+        this.state = newState;
+        for (const fn of this._listeners) {
+            try { fn(newState, this.keyboardHeight); } catch (_) { /* ignore */ }
+        }
+    }
+
+    /** @private */
+    _updateKeyboardOffset() {
         document.documentElement.style.setProperty(
-            '--keyboard-offset',
-            `${Math.max(0, heightDiff)}px`,
+            '--keyboard-height', `${this.keyboardHeight}px`,
         );
     }
 
-    /**
-     * @private
-     * Called when the virtual keyboard opens.
-     * @param {number} keyboardHeight
-     */
-    _onKeyboardOpen(keyboardHeight) {
-        this._keyboardVisible = true;
-
-        // Save chat scroll position before freeze
-        const chat = document.getElementById('chat');
-        const scrollBefore = chat?.scrollTop;
-
-        // Freeze layout
-        this._freeze();
-
-        // Restore scroll position (keyboard open can cause jump)
-        if (chat && scrollBefore != null) {
-            this._scrollRestoreTimer = setTimeout(() => {
-                chat.scrollTop = scrollBefore;
-                this._scrollRestoreTimer = null;
-            }, 50);
-        }
-
-        // Unfreeze after keyboard animation completes (~300ms typical)
-        this._scheduleUnfreeze(350);
-
-        console.debug(`${LOG} Keyboard opened (height: ~${keyboardHeight}px)`);
-    }
-
-    /**
-     * @private
-     * Called when the virtual keyboard closes.
-     */
-    _onKeyboardClose() {
-        this._keyboardVisible = false;
-
-        // Save scroll position
-        const chat = document.getElementById('chat');
-        const scrollBefore = chat?.scrollTop;
-
-        // Freeze during close transition
-        this._freeze();
-
-        // Update stable height (orientation may have changed)
-        this._stableViewportHeight = window.visualViewport?.height || window.innerHeight;
-        this._setStableVH();
-
-        // Restore scroll
-        if (chat && scrollBefore != null) {
-            this._scrollRestoreTimer = setTimeout(() => {
-                chat.scrollTop = scrollBefore;
-                this._scrollRestoreTimer = null;
-            }, 50);
-        }
-
-        // Unfreeze after close animation
-        this._scheduleUnfreeze(350);
-
-        console.debug(`${LOG} Keyboard closed`);
-    }
-
-    /**
-     * @private
-     * Schedule unfreeze with cancellation of previous timer.
-     * @param {number} ms
-     */
-    _scheduleUnfreeze(ms) {
-        if (this._unfreezeTimer) {
-            clearTimeout(this._unfreezeTimer);
-        }
-        this._unfreezeTimer = setTimeout(() => {
-            this._unfreeze();
-            this._unfreezeTimer = null;
-        }, ms);
-    }
-
-    // ---------------------------------------------------------------
-    // Focus/Blur Listeners (Fallback for no visualViewport)
-    // ---------------------------------------------------------------
+    // ── Scroll Position Preservation ────────────────────────────────
 
     /** @private */
-    _setupFocusListeners() {
-        this._focusHandler = (e) => {
-            if (this._isTextInput(e.target)) {
-                // Slight delay to catch the keyboard opening
-                setTimeout(() => {
-                    if (!this._keyboardVisible) {
-                        const heightDiff = this._stableViewportHeight - (window.visualViewport?.height || window.innerHeight);
-                        if (heightDiff > 100) {
-                            this._onKeyboardOpen(heightDiff);
-                        }
-                    }
-                }, 100);
-            }
-        };
-
-        this._blurHandler = (e) => {
-            if (this._isTextInput(e.target)) {
-                // Delay to allow for focus switch between inputs
-                setTimeout(() => {
-                    const active = document.activeElement;
-                    if (!this._isTextInput(active)) {
-                        if (this._keyboardVisible) {
-                            this._onKeyboardClose();
-                        }
-                    }
-                }, 150);
-            }
-        };
-
-        document.addEventListener('focusin', this._focusHandler, { passive: true });
-        document.addEventListener('focusout', this._blurHandler, { passive: true });
+    _saveScrollPos() {
+        const chat = document.getElementById('chat');
+        if (chat) this._chatScrollPos = chat.scrollTop;
     }
 
     /** @private */
-    _removeFocusListeners() {
-        if (this._focusHandler) {
-            document.removeEventListener('focusin', this._focusHandler);
-            this._focusHandler = null;
-        }
-        if (this._blurHandler) {
-            document.removeEventListener('focusout', this._blurHandler);
-            this._blurHandler = null;
+    _restoreScrollPos() {
+        const chat = document.getElementById('chat');
+        if (chat && this._chatScrollPos > 0) {
+            chat.scrollTop = this._chatScrollPos;
         }
     }
 
+    // ── Targeted Freeze CSS ─────────────────────────────────────────
+
     /**
      * @private
-     * @param {Element|null} el
-     * @returns {boolean}
+     * Inject freeze CSS targeting ONLY the elements that cause lag.
+     * Much faster than the previous `* { transition: 0s }` approach.
      */
-    _isTextInput(el) {
-        if (!el) return false;
-        const tag = el.tagName;
-        if (tag === 'TEXTAREA') return true;
-        if (tag === 'INPUT') {
-            const type = el.type?.toLowerCase();
-            return !type || type === 'text' || type === 'search' || type === 'url' || type === 'email' || type === 'number';
-        }
-        return el.isContentEditable;
+    _injectFreezeCSS() {
+        if (this._freezeEl) return;
+        this._freezeEl = document.createElement('style');
+        this._freezeEl.id = FREEZE_ID;
+        this._freezeEl.textContent = `
+/* [PerfOpt] Keyboard transition freeze - targets specific laggy elements */
+#bg1, #bg_custom,
+#sheld,
+#top-bar, #top-settings-holder,
+.drawer-content,
+#left-nav-panel, #right-nav-panel,
+#floatingPrompt, #cfgConfig,
+#send_form, #form_sheld,
+.scrollableInner,
+#character_popup, #world_popup {
+    transition: none !important;
+    animation: none !important;
+}
+#send_form,
+.drawer-content,
+#left-nav-panel, #right-nav-panel,
+#top-bar, #top-settings-holder,
+.popup, .popup-content {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+}
+#chat {
+    overflow-anchor: none !important;
+}`;
+        document.head.appendChild(this._freezeEl);
     }
 
-    // ---------------------------------------------------------------
-    // Resize Guard
-    // ---------------------------------------------------------------
+    /** @private */
+    _removeFreezeCSS() {
+        if (this._freezeEl) {
+            this._freezeEl.remove();
+            this._freezeEl = null;
+        }
+    }
+
+    // ── Resize Event Guard ──────────────────────────────────────────
 
     /**
      * @private
-     * Intercept window resize events during keyboard transitions.
-     * Prevents SillyTavern's resize handler from running expensive
-     * operations while the keyboard is animating.
+     * Intercept resize events during keyboard transition to prevent
+     * SillyTavern's power-user.js handler from running expensive
+     * operations (adjustAutocomplete, setHotswaps, zoom reporting).
+     *
+     * Uses capture phase to fire before jQuery handlers.
+     * Only suppresses during 'opening' and 'closing' states.
      */
-    _setupResizeGuard() {
-        this._resizeHandler = (e) => {
-            if (this._keyboardVisible || this._unfreezeTimer) {
-                // We're in a keyboard transition - suppress
+    _bindResizeGuard() {
+        this._onResizeCapture = (e) => {
+            if (this.state === 'opening' || this.state === 'closing') {
                 e.stopImmediatePropagation();
             }
         };
-
-        // Add with highest priority (capture phase)
-        window.addEventListener('resize', this._resizeHandler, { capture: true });
+        window.addEventListener('resize', this._onResizeCapture, true);
     }
 
     /** @private */
-    _removeResizeGuard() {
-        if (this._resizeHandler) {
-            window.removeEventListener('resize', this._resizeHandler, { capture: true });
-            this._resizeHandler = null;
+    _unbindResizeGuard() {
+        if (this._onResizeCapture) {
+            window.removeEventListener('resize', this._onResizeCapture, true);
+            this._onResizeCapture = null;
+        }
+    }
+
+    // ── Timers ──────────────────────────────────────────────────────
+
+    /**
+     * @private
+     * @param {number} ms
+     * @param {Function} callback
+     */
+    _scheduleUnfreeze(ms, callback) {
+        this._clearTimers();
+        this._unfreezeTimer = setTimeout(() => {
+            this._removeFreezeCSS();
+            this._unfreezeTimer = null;
+            callback?.();
+        }, ms);
+    }
+
+    /** @private */
+    _clearTimers() {
+        if (this._unfreezeTimer) {
+            clearTimeout(this._unfreezeTimer);
+            this._unfreezeTimer = null;
+        }
+        if (this._rafId) {
+            cancelAnimationFrame(this._rafId);
+            this._rafId = null;
         }
     }
 }
