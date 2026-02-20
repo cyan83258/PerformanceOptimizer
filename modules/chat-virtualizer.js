@@ -1,31 +1,43 @@
 /**
- * Chat Virtualizer Module
+ * Chat Virtualizer Module v2
  *
- * Implements virtual scrolling for the chat container (#chat).
- * Only messages within the visible viewport (plus a configurable buffer)
- * are fully rendered in the DOM. Off-screen messages are collapsed to
- * lightweight placeholders that preserve their height, keeping the
- * scrollbar accurate.
+ * Virtual scrolling for #chat - only viewport-adjacent messages stay hydrated.
+ * Off-screen messages are collapsed to fixed-height placeholders.
  *
- * This dramatically reduces DOM node count and reflow/repaint cost
- * in chats with hundreds of messages.
+ * v2 improvements over v1:
+ *   1. Instant bulk dehydration on chat load
+ *      - Phase-separated DOM reads (heights) then writes (dehydration)
+ *      - Eliminates the "render-everything-first" stall
+ *   2. CSS-driven child hiding
+ *      - `.mes[data-perf-dehydrated] > *` rule handles visibility
+ *      - No per-child JS iteration needed in dehydrate/hydrate
+ *   3. Bulk load detection via MutationObserver
+ *      - Detects when >=15 messages are added within 150ms
+ *      - Triggers bulk dehydration after scroll position settles
+ *   4. Scroll direction tracking for future directional prefetch
+ *   5. Concurrent-safe processing (guards against re-entrant calls)
  *
- * Strategy:
- *   - Uses IntersectionObserver (efficient, no scroll-event overhead)
- *   - Messages entering the viewport are "hydrated" (display restored)
- *   - Messages leaving the buffer zone are "dehydrated" (children hidden,
- *     fixed height placeholder shown)
- *   - The last N messages are always kept hydrated (for context & UX)
- *   - Currently active/editing messages are never dehydrated
+ * How dehydration works:
+ *   - Set `data-perf-dehydrated="1"` attribute on .mes element
+ *   - CSS rule `.mes[data-perf-dehydrated] > * { display: none }` hides children
+ *   - `content-visibility: hidden` tells the browser to skip rendering
+ *   - Fixed height preserves scroll position accuracy
+ *
+ * How hydration works:
+ *   - Remove `data-perf-dehydrated` attribute
+ *   - CSS automatically restores child visibility
+ *   - Clear inline height/overflow
  */
 
-/** @typedef {{ bufferSize: number, alwaysVisibleTail: number }} VirtualizerOptions */
+/** @typedef {{ bufferSize: number, alwaysVisibleTail: number, bulkLoadThreshold: number }} VirtualizerOptions */
 
 const DEFAULT_OPTIONS = {
-    /** Number of extra messages to keep hydrated above/below viewport */
+    /** Extra messages to keep hydrated above/below viewport */
     bufferSize: 5,
     /** Always keep the last N messages hydrated */
     alwaysVisibleTail: 10,
+    /** Minimum messages added in a batch to trigger bulk dehydration */
+    bulkLoadThreshold: 15,
 };
 
 const DEHYDRATED_ATTR = 'data-perf-dehydrated';
@@ -40,6 +52,7 @@ export class ChatVirtualizer {
         this.active = false;
         /** @type {VirtualizerOptions} */
         this.options = { ...DEFAULT_OPTIONS, ...options };
+
         /** @type {IntersectionObserver|null} */
         this._observer = null;
         /** @type {MutationObserver|null} */
@@ -48,10 +61,31 @@ export class ChatVirtualizer {
         this._chatContainer = null;
         /** @type {Set<Element>} Messages currently in/near viewport */
         this._visibleSet = new Set();
+
+        /** @type {number|null} */
+        this._dehydrateTimer = null;
+        /** @type {number|null} */
+        this._bulkTimer = null;
+
+        /** @type {Function|null} */
+        this._scrollHandler = null;
+        /** @type {number} 1 = down, -1 = up */
+        this._scrollDirection = 1;
+        /** @type {number} */
+        this._lastScrollTop = 0;
+
+        /** @type {boolean} Guard against re-entrant bulk processing */
+        this._processingBulk = false;
     }
+
+    // ==================================================================
+    // Public API
+    // ==================================================================
 
     /** Enable virtualization. */
     enable() {
+        if (this.active) return;
+
         this._chatContainer = document.getElementById('chat');
         if (!this._chatContainer) {
             console.warn('[PerfOptimizer/ChatVirt] #chat not found');
@@ -60,53 +94,74 @@ export class ChatVirtualizer {
 
         this._setupIntersectionObserver();
         this._setupMutationObserver();
-        this._processExistingMessages();
+        this._setupScrollTracker();
+        this._processExisting();
+
         this.active = true;
-        console.log('[PerfOptimizer/ChatVirt] Enabled');
+        console.log('[PerfOptimizer/ChatVirt] v2 enabled');
     }
 
     /** Disable virtualization and rehydrate all messages. */
     disable() {
-        if (this._observer) {
-            this._observer.disconnect();
-            this._observer = null;
+        this._observer?.disconnect();
+        this._observer = null;
+
+        this._mutationObserver?.disconnect();
+        this._mutationObserver = null;
+
+        if (this._scrollHandler && this._chatContainer) {
+            this._chatContainer.removeEventListener('scroll', this._scrollHandler);
         }
-        if (this._mutationObserver) {
-            this._mutationObserver.disconnect();
-            this._mutationObserver = null;
-        }
+        this._scrollHandler = null;
+
+        clearTimeout(this._dehydrateTimer);
+        clearTimeout(this._bulkTimer);
+        this._dehydrateTimer = null;
+        this._bulkTimer = null;
+
         this._rehydrateAll();
         this._visibleSet.clear();
         this.active = false;
     }
 
     /**
-     * Update options.
+     * Update options at runtime.
      * @param {Partial<VirtualizerOptions>} options
      */
     update(options) {
         this.options = { ...this.options, ...options };
-        // Rebuild observer with new rootMargin
         if (this.active) {
             this.disable();
             this.enable();
         }
     }
 
-    /**
-     * Force rehydrate all messages (e.g., before printing or export).
-     */
+    /** Force rehydrate all messages (e.g., before export). */
     rehydrateAll() {
         this._rehydrateAll();
     }
 
-    // ---------------------------------------------------------------
+    // ==================================================================
+    // Scroll Direction Tracking
+    // ==================================================================
+
+    /** @private */
+    _setupScrollTracker() {
+        this._lastScrollTop = this._chatContainer.scrollTop;
+        this._scrollHandler = () => {
+            const top = this._chatContainer.scrollTop;
+            this._scrollDirection = top >= this._lastScrollTop ? 1 : -1;
+            this._lastScrollTop = top;
+        };
+        this._chatContainer.addEventListener('scroll', this._scrollHandler, { passive: true });
+    }
+
+    // ==================================================================
     // IntersectionObserver
-    // ---------------------------------------------------------------
+    // ==================================================================
 
     /** @private */
     _setupIntersectionObserver() {
-        // Buffer zone: bufferSize * estimated message height
         const bufferPx = this.options.bufferSize * 250;
 
         this._observer = new IntersectionObserver(
@@ -118,9 +173,7 @@ export class ChatVirtualizer {
             },
         );
 
-        // Observe all existing .mes elements
-        const messages = this._chatContainer.querySelectorAll('.mes');
-        for (const mes of messages) {
+        for (const mes of this._chatContainer.querySelectorAll('.mes')) {
             this._observer.observe(mes);
         }
     }
@@ -138,12 +191,10 @@ export class ChatVirtualizer {
                 this._visibleSet.delete(entry.target);
             }
         }
-
-        // Debounced dehydration pass
         this._scheduleDehydration();
     }
 
-    /** @private Dehydration is debounced to avoid flicker on fast scrolling */
+    /** @private Debounced to prevent flicker during fast scrolling. */
     _scheduleDehydration() {
         if (this._dehydrateTimer) return;
         this._dehydrateTimer = setTimeout(() => {
@@ -152,50 +203,148 @@ export class ChatVirtualizer {
         }, 200);
     }
 
-    // ---------------------------------------------------------------
-    // MutationObserver - watch for new messages
-    // ---------------------------------------------------------------
+    // ==================================================================
+    // MutationObserver - detects new messages & bulk chat loads
+    // ==================================================================
 
     /** @private */
     _setupMutationObserver() {
+        let pendingCount = 0;
+
         this._mutationObserver = new MutationObserver((mutations) => {
             for (const mutation of mutations) {
                 for (const node of mutation.addedNodes) {
                     if (node.nodeType === Node.ELEMENT_NODE && node.classList?.contains('mes')) {
                         this._observer?.observe(node);
+                        pendingCount++;
                     }
                 }
             }
+
+            if (pendingCount > 0) {
+                clearTimeout(this._bulkTimer);
+                const count = pendingCount;
+                this._bulkTimer = setTimeout(() => {
+                    if (count >= this.options.bulkLoadThreshold) {
+                        this._onBulkLoad();
+                    }
+                    pendingCount = 0;
+                }, 150);
+            }
         });
 
-        this._mutationObserver.observe(this._chatContainer, {
-            childList: true,
-        });
-    }
-
-    // ---------------------------------------------------------------
-    // Hydrate / Dehydrate
-    // ---------------------------------------------------------------
-
-    /** @private Process existing messages on startup */
-    _processExistingMessages() {
-        // Let IntersectionObserver handle initial visibility detection.
-        // But ensure tail messages are always visible.
-        const messages = this._chatContainer.querySelectorAll('.mes');
-        const total = messages.length;
-        const tailStart = Math.max(0, total - this.options.alwaysVisibleTail);
-
-        for (let i = tailStart; i < total; i++) {
-            this._visibleSet.add(messages[i]);
-        }
+        this._mutationObserver.observe(this._chatContainer, { childList: true });
     }
 
     /**
      * @private
-     * Dehydrate messages that are not in the visible set and not protected.
+     * Called when a bulk load of messages is detected.
+     * Waits two frames for ST's scrollChatToBottom to settle.
+     */
+    _onBulkLoad() {
+        if (this._processingBulk) return;
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+                this._bulkDehydrate();
+            });
+        });
+    }
+
+    // ==================================================================
+    // Initial Processing
+    // ==================================================================
+
+    /** @private Handle messages already in the DOM when module enables. */
+    _processExisting() {
+        const messages = this._chatContainer.querySelectorAll('.mes');
+        if (messages.length >= this.options.bulkLoadThreshold) {
+            this._bulkDehydrate();
+        } else {
+            // Small chat: just mark tail as visible
+            const tailStart = Math.max(0, messages.length - this.options.alwaysVisibleTail);
+            for (let i = tailStart; i < messages.length; i++) {
+                this._visibleSet.add(messages[i]);
+            }
+        }
+    }
+
+    // ==================================================================
+    // Bulk Dehydration (KEY v2 OPTIMIZATION)
+    // ==================================================================
+
+    /**
+     * @private
+     * Dehydrate all off-screen messages in two phases:
+     *   Phase 1: Batch-read all heights (single forced layout)
+     *   Phase 2: Batch-write attributes & styles (no layout triggers)
+     *
+     * This is drastically faster than the v1 approach of waiting for
+     * IntersectionObserver to gradually dehydrate messages one-by-one.
+     */
+    _bulkDehydrate() {
+        if (this._processingBulk) return;
+        this._processingBulk = true;
+
+        try {
+            const messages = this._chatContainer.querySelectorAll('.mes');
+            const total = messages.length;
+
+            if (total <= this.options.alwaysVisibleTail) {
+                return;
+            }
+
+            // Calculate how many bottom messages to keep hydrated
+            const containerH = this._chatContainer.clientHeight || window.innerHeight;
+            const visibleEstimate = Math.ceil(containerH / 150);
+            const keepCount = Math.max(
+                visibleEstimate + this.options.bufferSize * 2,
+                this.options.alwaysVisibleTail,
+            );
+            const dehydrateEnd = Math.max(0, total - keepCount);
+
+            if (dehydrateEnd === 0) return;
+
+            // Phase 1: Batch-read heights (one forced layout, no interleaved writes)
+            const heights = new Array(dehydrateEnd);
+            for (let i = 0; i < dehydrateEnd; i++) {
+                heights[i] = messages[i].offsetHeight;
+            }
+
+            // Phase 2: Batch-write dehydration (pure writes, no layout triggers)
+            for (let i = 0; i < dehydrateEnd; i++) {
+                const mes = messages[i];
+                if (mes.hasAttribute(DEHYDRATED_ATTR)) continue;
+
+                mes.setAttribute(DEHYDRATED_ATTR, '1');
+                mes.setAttribute(HEIGHT_ATTR, String(heights[i]));
+                mes.style.height = heights[i] + 'px';
+                mes.style.minHeight = heights[i] + 'px';
+                mes.style.overflow = 'hidden';
+                mes.style.contentVisibility = 'hidden';
+            }
+
+            // Update visible set to only include kept messages
+            this._visibleSet.clear();
+            for (let i = dehydrateEnd; i < total; i++) {
+                this._visibleSet.add(messages[i]);
+            }
+
+            console.log(`[PerfOptimizer/ChatVirt] Bulk dehydrated ${dehydrateEnd}/${total} messages`);
+        } finally {
+            this._processingBulk = false;
+        }
+    }
+
+    // ==================================================================
+    // Per-Message Dehydrate / Hydrate
+    // ==================================================================
+
+    /**
+     * @private
+     * Dehydrate individual off-screen messages (ongoing scroll management).
      */
     _dehydrateOffscreen() {
-        if (!this._chatContainer) return;
+        if (!this._chatContainer || this._processingBulk) return;
 
         const messages = this._chatContainer.querySelectorAll('.mes');
         const total = messages.length;
@@ -204,11 +353,11 @@ export class ChatVirtualizer {
         for (let i = 0; i < total; i++) {
             const mes = messages[i];
 
-            // Skip: in visible set, in tail, being edited, or has active swipe
+            // Skip: visible, tail, last message, or being edited
             if (this._visibleSet.has(mes)) continue;
             if (i >= tailStart) continue;
-            if (mes.querySelector('.mes_edit_buttons:not([style*="display: none"])')) continue;
             if (mes.classList.contains('last_mes')) continue;
+            if (mes.querySelector('.mes_edit_buttons:not([style*="display: none"])')) continue;
 
             this._dehydrate(mes);
         }
@@ -216,32 +365,26 @@ export class ChatVirtualizer {
 
     /**
      * @private
-     * Collapse a message to a fixed-height placeholder.
+     * Collapse a single message to a fixed-height placeholder.
+     * CSS rule handles child hiding via attribute selector.
      * @param {HTMLElement} mes
      */
     _dehydrate(mes) {
         if (mes.hasAttribute(DEHYDRATED_ATTR)) return;
 
-        // Store current height
         const height = mes.offsetHeight;
-        mes.setAttribute(HEIGHT_ATTR, height);
         mes.setAttribute(DEHYDRATED_ATTR, '1');
-
-        // Hide children instead of removing (preserves event handlers)
-        for (const child of mes.children) {
-            child.style.display = 'none';
-        }
-
-        // Set fixed height to preserve scroll position
-        mes.style.minHeight = `${height}px`;
-        mes.style.height = `${height}px`;
+        mes.setAttribute(HEIGHT_ATTR, String(height));
+        mes.style.height = height + 'px';
+        mes.style.minHeight = height + 'px';
         mes.style.overflow = 'hidden';
         mes.style.contentVisibility = 'hidden';
     }
 
     /**
      * @private
-     * Restore a dehydrated message.
+     * Restore a dehydrated message to fully rendered state.
+     * CSS rule restores child visibility when attribute is removed.
      * @param {HTMLElement} mes
      */
     _hydrate(mes) {
@@ -249,27 +392,19 @@ export class ChatVirtualizer {
 
         mes.removeAttribute(DEHYDRATED_ATTR);
         mes.removeAttribute(HEIGHT_ATTR);
-
-        // Restore children visibility
-        for (const child of mes.children) {
-            child.style.display = '';
-        }
-
-        // Remove fixed sizing
-        mes.style.minHeight = '';
         mes.style.height = '';
+        mes.style.minHeight = '';
         mes.style.overflow = '';
         mes.style.contentVisibility = '';
     }
 
     /**
      * @private
-     * Rehydrate all dehydrated messages.
+     * Rehydrate all dehydrated messages (used on disable).
      */
     _rehydrateAll() {
         if (!this._chatContainer) return;
-        const dehydrated = this._chatContainer.querySelectorAll(`[${DEHYDRATED_ATTR}]`);
-        for (const mes of dehydrated) {
+        for (const mes of this._chatContainer.querySelectorAll(`[${DEHYDRATED_ATTR}]`)) {
             this._hydrate(mes);
         }
     }

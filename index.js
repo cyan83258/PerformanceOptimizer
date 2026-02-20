@@ -76,6 +76,9 @@ const DEFAULT_SETTINGS = {
     mobileTouch: {
         enabled: true,
     },
+    mobileRender: {
+        enabled: true,
+    },
 };
 
 // ===================================================================
@@ -122,6 +125,8 @@ let mobileKeyboard = null;
 let mobileLayout = null;
 /** @type {import('./modules/mobile-touch-optimizer.js').MobileTouchOptimizer|null} */
 let mobileTouch = null;
+/** @type {import('./modules/mobile-render-optimizer.js').MobileRenderOptimizer|null} */
+let mobileRender = null;
 
 // ===================================================================
 // Settings Management
@@ -188,6 +193,7 @@ async function initModules() {
         cssMod, settingsMod, domMod, scrollMod,
         chatVirtMod, promptMod, bgMod, avatarMod, frameMod, netMod,
         mobileKbMod, mobileLayoutMod, mobileTouchMod,
+        mobileRenderMod,
     ] = await Promise.all([
         safeImport('./modules/css-optimizer.js'),
         safeImport('./modules/settings-optimizer.js'),
@@ -243,6 +249,9 @@ async function initModules() {
     if (mobileTouchMod?.MobileTouchOptimizer) {
         mobileTouch = new mobileTouchMod.MobileTouchOptimizer();
     }
+    if (mobileRenderMod?.MobileRenderOptimizer) {
+        mobileRender = new mobileRenderMod.MobileRenderOptimizer();
+    }
 
     const loaded = [
         cssOptimizer && 'CSS',
@@ -258,6 +267,7 @@ async function initModules() {
         mobileKeyboard && 'MobileKB',
         mobileLayout && 'MobileLayout',
         mobileTouch && 'MobileTouch',
+        mobileRender && 'MobileRender',
     ].filter(Boolean);
 
     console.log(`${LOG_PREFIX} Modules loaded: ${loaded.join(', ')}`);
@@ -393,6 +403,15 @@ function applyOptimizations() {
         }
     }
 
+    // Mobile Render Optimizer
+    if (mobileRender) {
+        if (settings.mobileRender.enabled) {
+            mobileRender.enable();
+        } else {
+            mobileRender.disable();
+        }
+    }
+
     console.log(`${LOG_PREFIX} Optimizations applied.`);
 }
 
@@ -411,6 +430,7 @@ function disableAll() {
     mobileKeyboard?.disable();
     mobileLayout?.disable();
     mobileTouch?.disable();
+    mobileRender?.disable();
 }
 
 // ===================================================================
@@ -602,6 +622,17 @@ function createSettingsPanel() {
                     <div class="perf-opt-subtitle">탭 딜레이 제거, 스크롤 최적화, 입력 반응성을 개선합니다</div>
                 </div>
 
+                <!-- Mobile Render Optimizer -->
+                <div class="perf-opt-section" id="perf_opt_mobilerender_section">
+                    <div class="perf-opt-toggle">
+                        <label for="perf_opt_mobilerender">
+                            <b>🖥️ 모바일 렌더링 최적화</b>
+                        </label>
+                        <input type="checkbox" id="perf_opt_mobilerender" ${checked(settings.mobileRender.enabled)} />
+                    </div>
+                    <div class="perf-opt-subtitle">GPU 가속, 패널 히비네이션, 레이아웃 쓰로틀링으로 마이크로렉을 제거합니다</div>
+                </div>
+
                 <hr />
 
                 <!-- Status -->
@@ -766,6 +797,14 @@ function bindEvents() {
         updateStatus();
     });
 
+    // Mobile Render Optimizer toggle
+    $('#perf_opt_mobilerender').on('change', function () {
+        getSettings().mobileRender.enabled = this.checked;
+        saveSettings();
+        applyOptimizations();
+        updateStatus();
+    });
+
     // Apply button
     $('#perf_opt_apply').on('click', () => {
         applyOptimizations();
@@ -817,6 +856,7 @@ function syncUIFromSettings() {
     $('#perf_opt_mobilekb').prop('checked', s.mobileKeyboard.enabled);
     $('#perf_opt_mobilelayout').prop('checked', s.mobileLayout.enabled);
     $('#perf_opt_mobiletouch').prop('checked', s.mobileTouch.enabled);
+    $('#perf_opt_mobilerender').prop('checked', s.mobileRender.enabled);
 }
 
 /** Enable/disable section UI based on master toggle. */
@@ -836,6 +876,7 @@ function updateSectionStates() {
         '#perf_opt_mobilekb_section',
         '#perf_opt_mobilelayout_section',
         '#perf_opt_mobiletouch_section',
+        '#perf_opt_mobilerender_section',
     ];
     for (const sel of sections) {
         if (enabled) {
@@ -877,6 +918,7 @@ function updateStatus() {
     if (settings.mobileKeyboard.enabled) parts.push('\uBAA8\uBC14\uC77C\uD0A4\uBCF4\uB4DC');
     if (settings.mobileLayout.enabled) parts.push('\uBAA8\uBC14\uC77C\uB808\uC774\uC544\uC6C3');
     if (settings.mobileTouch.enabled) parts.push('\uBAA8\uBC14\uC77C\uD130\uCE58');
+    if (settings.mobileRender.enabled) parts.push('\uBAA8\uBC14\uC77C\uB80C\uB354\uB9C1');
 
     const text = parts.length > 0
         ? `\uC0C1\uD0DC: \uD65C\uC131\uD654 \u2014 ${parts.join(' | ')}`

@@ -6,6 +6,16 @@
  * =================================================================== */
 
 /* -------------------------------------------------------------------
+ * Chat Virtualizer v2 - CSS-driven dehydration
+ * Dehydrated messages have `data-perf-dehydrated` attribute set.
+ * This rule hides all children without JS iteration, making
+ * bulk dehydration/hydration O(1) per message.
+ * ------------------------------------------------------------------- */
+.mes[data-perf-dehydrated] > * {
+    display: none !important;
+}
+
+/* -------------------------------------------------------------------
  * Message Virtualization
  * Skip rendering of off-screen messages for massive scroll perf gain.
  * ------------------------------------------------------------------- */
