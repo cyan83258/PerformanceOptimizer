@@ -1,0 +1,90 @@
+/* ===================================================================
+ * SillyTavern Performance Optimizer - Base Styles
+ * Always active when the extension is enabled.
+ * Safe CSS containment & rendering hints that improve performance
+ * without changing visual appearance.
+ * =================================================================== */
+
+/* -------------------------------------------------------------------
+ * Message Virtualization
+ * Skip rendering of off-screen messages for massive scroll perf gain.
+ * ------------------------------------------------------------------- */
+.mes {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 200px;
+}
+
+/* -------------------------------------------------------------------
+ * CSS Containment
+ * Isolate layout recalculations to specific subtrees.
+ * ------------------------------------------------------------------- */
+#chat {
+    contain: layout style;
+}
+
+.completion_prompt_manager_list {
+    contain: layout style;
+}
+
+/* -------------------------------------------------------------------
+ * Scroll Behavior
+ * Prevent scroll chaining between nested containers.
+ * ------------------------------------------------------------------- */
+#chat,
+.completion_prompt_manager_list,
+#sheld,
+.drawer-content,
+.popup-content {
+    overscroll-behavior: contain;
+}
+
+/* ===================================================================
+ * Extension Settings Panel Styles
+ * =================================================================== */
+.perf-opt-panel {
+    padding: 5px 0;
+}
+
+.perf-opt-section {
+    margin: 6px 0;
+    padding: 5px 10px;
+    border-left: 2px solid var(--SmartThemeQuoteColor, #888);
+}
+
+.perf-opt-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 3px 0;
+    gap: 8px;
+}
+
+.perf-opt-toggle label {
+    flex: 1;
+    cursor: pointer;
+    font-size: 0.95em;
+}
+
+.perf-opt-status {
+    font-size: 0.85em;
+    padding: 5px 0;
+    color: var(--SmartThemeQuoteColor, #888);
+}
+
+.perf-opt-subtitle {
+    font-size: 0.82em;
+    color: var(--SmartThemeQuoteColor, #888);
+    margin-bottom: 3px;
+}
+
+.perf-opt-btn-row {
+    display: flex;
+    gap: 5px;
+    flex-wrap: wrap;
+    margin-top: 5px;
+}
+
+.perf-opt-section.disabled {
+    opacity: 0.5;
+    pointer-events: none;
+}
