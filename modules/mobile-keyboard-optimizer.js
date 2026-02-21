@@ -70,6 +70,31 @@ const KB_INPUT = [
     '[contenteditable="true"]',
 ].join(',');
 
+/**
+ * Ancestor selectors for UI panels/drawers/popups.
+ * Inputs inside these containers should NOT trigger a layout freeze,
+ * because the freeze CSS (containment, content-visibility) can cause
+ * menus and panels to visually close or break.
+ *
+ * Only #send_textarea and textareas inside #chat should trigger freeze.
+ */
+const PANEL_ANCESTORS = [
+    '#right-nav-panel',
+    '#left-nav-panel',
+    '.drawer-content',
+    '.popup',
+    '.popup-content',
+    '#character_popup',
+    '#world_popup',
+    '#floatingPrompt',
+    '#cfgConfig',
+    '#shadow_popup',
+    '.shadow_popup',
+    '#extensions_settings',
+    '#extensions_settings2',
+    '#movingDivs',
+].join(',');
+
 // ─────────────────────────────────────────────────────────────────
 // Freeze CSS — activated solely by body class toggle.
 // v4: Relaxed containment (layout+style, not strict/paint) so
@@ -258,6 +283,19 @@ export class MobileKeyboardOptimizer {
         return Math.max(vv, window.innerHeight);
     }
 
+    /**
+     * @private
+     * Check if an element is inside a settings panel, drawer, or popup.
+     * These containers should not trigger a freeze because the freeze CSS
+     * (containment changes, content-visibility) can break their layout
+     * and cause menus to visually close.
+     * @param {Element} el
+     * @returns {boolean}
+     */
+    _isInsidePanel(el) {
+        return !!el.closest(PANEL_ANCESTORS);
+    }
+
     // ================================================================
     // Layer 1 — Focus Pre-Freeze (Smart Skip)
     // ================================================================
@@ -267,6 +305,10 @@ export class MobileKeyboardOptimizer {
         this._onFocusIn = (e) => {
             const el = e.target;
             if (!el?.matches?.(KB_INPUT)) return;
+
+            // SKIP freeze for inputs inside settings panels/drawers/popups.
+            // Freezing layout while interacting with these causes menus to close.
+            if (this._isInsidePanel(el)) return;
 
             // KEY v4 OPTIMIZATION: If keyboard is already open,
             // this is just an input-to-input switch. No freeze needed.
@@ -293,6 +335,9 @@ export class MobileKeyboardOptimizer {
         this._onFocusOut = (e) => {
             const el = e.target;
             if (!el?.matches?.(KB_INPUT)) return;
+
+            // Skip for panel inputs (same reason as focusin)
+            if (this._isInsidePanel(el)) return;
 
             // If focus is moving to another keyboard input, skip.
             // relatedTarget gives us the next focused element.
