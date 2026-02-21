@@ -70,12 +70,6 @@ export class ScrollOptimizer {
 /* Prompt manager entries: CSS containment to isolate repaints */
 .completion_prompt_manager_popup_entry {
     contain: layout style;
-}
-
-/* Drawer contents: contain layout recalculations */
-.drawer-content,
-.popup-content {
-    contain: layout;
 }`;
         document.head.appendChild(this._styleEl);
     }

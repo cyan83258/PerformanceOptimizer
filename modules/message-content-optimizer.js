@@ -120,10 +120,10 @@ export class MessageContentOptimizer {
         if (this.options.containment) {
             rules.push(`
                 #chat .mes {
-                    contain: layout style;
+                    contain: style;
                 }
                 #chat .mes .mes_text {
-                    contain: layout style;
+                    contain: style;
                 }
             `);
         }

@@ -9,24 +9,16 @@
  *   1. GPU Layer Promotion
  *      - will-change: transform on #chat for compositor-driven scrolling
  *      - translateZ(0) hack for older mobile WebKit/Blink
- *   2. Panel Hibernation
- *      - content-visibility: hidden on closed drawers/panels
- *      - MutationObserver detects open/close state changes
- *      - Hidden panels produce zero rendering cost
- *   3. Paint Containment
- *      - contain: strict on non-visible subtrees
- *      - contain: layout style paint on message elements
- *   4. Idle-Time Cleanup
- *      - requestIdleCallback for non-critical DOM housekeeping
- *      - Removes empty text nodes from #chat
- *   5. Reduced Transitions
+ *   2. Reduced Transitions
  *      - Disables non-essential CSS transitions on mobile
  *      - Removes hover-triggered effects (irrelevant on touch)
+ *   3. Idle-Time Cleanup
+ *      - requestIdleCallback for non-critical DOM housekeeping
+ *      - Removes empty text nodes from #chat
  *
- * NOTE: Resize throttling is handled by the keyboard optimizer
- * (which has a more sophisticated freeze/unfreeze mechanism).
- * This module intentionally does NOT intercept resize events
- * to avoid conflicts.
+ * NOTE: Resize throttling is handled by the keyboard optimizer.
+ * NOTE: CSS containment and content-visibility are NOT used here
+ *       because they interfere with drawer/panel/popup rendering.
  *
  * Mobile detection: window.innerWidth <= 1000px
  * All changes are fully reversible on disable().
@@ -44,30 +36,6 @@ const OPTIMIZER_CSS = `
     -webkit-overflow-scrolling: touch;
 }
 
-/* Paint containment on message elements */
-.mes {
-    contain: layout style paint;
-}
-
-/* Hibernate closed drawers - zero render cost */
-.drawer:not(.openDrawer) > .drawer-content {
-    content-visibility: hidden;
-    contain-intrinsic-size: 0 0;
-}
-
-#right-nav-panel:not(.openDrawer) {
-    content-visibility: hidden;
-    contain-intrinsic-size: 0 0;
-}
-
-/* Container isolation — only apply to elements that don't contain
-   panels/drawers. Do NOT put contain on #sheld as it is the parent
-   of all drawers and containment breaks their internal layout. */
-
-.shadow_popup {
-    contain: layout style paint;
-}
-
 /* Disable hover effects on touch devices */
 @media (hover: none) and (pointer: coarse) {
     .mes:hover,
@@ -76,12 +44,6 @@ const OPTIMIZER_CSS = `
         transition-duration: 0s !important;
         animation-duration: 0s !important;
     }
-}
-
-/* Optimize non-visible panels */
-#WorldInfo:not(.open),
-#character_popup:not(.open) {
-    content-visibility: hidden;
 }
 `.trim();
 
@@ -92,9 +54,6 @@ export class MobileRenderOptimizer {
 
         /** @type {HTMLStyleElement|null} */
         this._styleEl = null;
-
-        /** @type {MutationObserver|null} */
-        this._drawerObserver = null;
 
         /** @type {number|null} */
         this._idleCallbackId = null;
@@ -118,7 +77,6 @@ export class MobileRenderOptimizer {
         }
 
         this._injectStyles();
-        this._setupDrawerObserver();
         this._setupIdleCleanup();
         this._promoteGPULayers();
 
@@ -138,12 +96,6 @@ export class MobileRenderOptimizer {
         if (this._styleEl) {
             this._styleEl.remove();
             this._styleEl = null;
-        }
-
-        // Disconnect drawer observer
-        if (this._drawerObserver) {
-            this._drawerObserver.disconnect();
-            this._drawerObserver = null;
         }
 
         // Cancel idle callback
@@ -202,44 +154,7 @@ export class MobileRenderOptimizer {
     }
 
     // ==================================================================
-    // 3. Drawer Observer (Panel Hibernation)
-    // ==================================================================
-
-    /**
-     * @private
-     * Watch for drawer open/close state changes.
-     * When a drawer opens, ensure GPU promotion.
-     * When it closes, the CSS rule applies content-visibility: hidden.
-     */
-    _setupDrawerObserver() {
-        const drawers = document.querySelectorAll('.drawer, #right-nav-panel');
-        if (drawers.length === 0) return;
-
-        this._drawerObserver = new MutationObserver((mutations) => {
-            for (const mutation of mutations) {
-                if (mutation.type !== 'attributes' || mutation.attributeName !== 'class') continue;
-
-                const el = mutation.target;
-                const isOpen = el.classList.contains('openDrawer') || el.classList.contains('open');
-
-                if (isOpen) {
-                    // Drawer just opened — ensure smooth rendering
-                    const content = el.querySelector('.drawer-content') || el;
-                    content.style.contentVisibility = '';
-                }
-            }
-        });
-
-        for (const drawer of drawers) {
-            this._drawerObserver.observe(drawer, {
-                attributes: true,
-                attributeFilter: ['class'],
-            });
-        }
-    }
-
-    // ==================================================================
-    // 4. Idle-Time Cleanup
+    // 3. Idle-Time Cleanup
     // ==================================================================
 
     /**

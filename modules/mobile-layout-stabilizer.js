@@ -9,9 +9,8 @@
  *   1. Capturing the full viewport height ONCE on page load
  *   2. Injecting CSS that overrides every dvh/vh reference with
  *      stable CSS custom properties (--stable-h, --stable-h-XX)
- *   3. Applying CSS containment on layout-critical containers
- *   4. Promoting key elements to GPU compositor layers
- *   5. Only updating the stable height on orientation change
+ *   3. Promoting key elements to GPU compositor layers
+ *   4. Only updating the stable height on orientation change
  *
  * This means when the keyboard opens, ZERO layout recalculation
  * happens on background, panels, drawers, etc.
@@ -130,7 +129,6 @@ export class MobileLayoutStabilizer {
     /**
      * @private
      * Override EVERY dvh/vh height in mobile-styles.css with stable values.
-     * Also applies CSS containment and GPU layer promotion.
      */
     _injectStableCSS() {
         this._removeCSS();
@@ -152,13 +150,16 @@ export class MobileLayoutStabilizer {
      * @private
      * Build the complete override CSS.
      * Each rule directly counters a specific dvh/vh usage in mobile-styles.css.
+     *
+     * NOTE: CSS containment (contain: layout/paint/content) is intentionally
+     * NOT used on interactive containers (#chat, #sheld, #form_sheld, drawers,
+     * popups) because it prevents menus/panels from rendering correctly.
      */
     _buildCSS() {
         return `
 /* ================================================================
    [PerfOpt] Mobile Layout Stabilizer
    Replaces all dvh/vh heights with stable px-based CSS vars.
-   Applies containment and GPU promotion for zero-reflow layout.
    ================================================================ */
 
 @media screen and (max-width: 1000px) {
@@ -169,7 +170,6 @@ export class MobileLayoutStabilizer {
     #bg1,
     #bg_custom {
         height: var(--stable-h) !important;
-        contain: size layout style paint;
     }
 
     /* ── Drawers (mobile-styles.css L192-193) ─────────────────────
@@ -213,13 +213,12 @@ export class MobileLayoutStabilizer {
         max-height: var(--stable-h-90) !important;
     }
 
-    /* ── Popups & drawers (mobile-styles.css L557-558, L560-561) ──
+    /* ── Popups (mobile-styles.css L557-558, L560-561) ────────────
        Original: height/max-height: calc(100dvh - 70px) */
     #character_popup,
     #world_popup,
     #left-nav-panel,
-    #right-nav-panel,
-    .drawer-content {
+    #right-nav-panel {
         max-height: var(--stable-h-70) !important;
     }
 
@@ -238,19 +237,9 @@ export class MobileLayoutStabilizer {
         max-height: calc(var(--stable-h) * 0.6 - 60px) !important;
     }
 
-    /* ── CSS Containment ──────────────────────────────────────────
-       Isolate layout recalculation to specific containers */
+    /* ── Scroll & Overscroll ──────────────────────────────────────── */
     #chat {
-        contain: content;
         -webkit-overflow-scrolling: touch;
-    }
-
-    #form_sheld {
-        contain: layout style;
-    }
-
-    #send_form {
-        contain: layout style;
     }
 
     body {
