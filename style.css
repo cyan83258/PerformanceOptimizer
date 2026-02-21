@@ -98,3 +98,21 @@
     opacity: 0.5;
     pointer-events: none;
 }
+
+/* -------------------------------------------------------------------
+ * Mobile Keyboard Transition
+ * Prevent layout thrashing during keyboard open/close.
+ * Active only when body.perf-kb-freeze is set by keyboard optimizer.
+ * ------------------------------------------------------------------- */
+@media screen and (max-width: 1000px) {
+    /* Messages being edited must always be fully visible. */
+    .mes[data-perf-editing="1"] {
+        content-visibility: visible !important;
+        contain: none !important;
+    }
+
+    /* Ensure dehydrated children of editing messages still show. */
+    .mes[data-perf-editing="1"][data-perf-dehydrated] > * {
+        display: initial !important;
+    }
+}

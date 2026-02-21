@@ -169,8 +169,7 @@ export class MobileLayoutStabilizer {
     #bg1,
     #bg_custom {
         height: var(--stable-h) !important;
-        will-change: transform;
-        contain: strict;
+        contain: size layout style paint;
     }
 
     /* ── Drawers (mobile-styles.css L192-193) ─────────────────────
@@ -241,7 +240,6 @@ export class MobileLayoutStabilizer {
        Isolate layout recalculation to specific containers */
     #chat {
         contain: content;
-        will-change: scroll-position;
         -webkit-overflow-scrolling: touch;
     }
 
@@ -251,15 +249,6 @@ export class MobileLayoutStabilizer {
 
     #send_form {
         contain: layout style;
-        will-change: transform;
-    }
-
-    /* ── GPU Layer Promotion ──────────────────────────────────────
-       Move position:fixed elements to compositor layer */
-    #top-bar,
-    #top-settings-holder {
-        will-change: transform;
-        transform: translateZ(0);
     }
 
     body {

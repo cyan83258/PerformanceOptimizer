@@ -1,53 +1,62 @@
 /**
- * Mobile Keyboard Optimizer v3
+ * Mobile Keyboard Optimizer v4
  *
- * Eliminates keyboard open/close lag through three defense layers:
+ * Eliminates keyboard open/close lag through adaptive freeze layers.
+ *
+ * v4 improvements over v3:
+ *   - Faster timing: STABLE_MS 250→100ms, FOCUS_TIMEOUT 600→350ms
+ *   - Smart skip: No freeze when switching inputs with keyboard already open
+ *   - Relaxed containment: layout+style instead of strict (allows edit UI)
+ *   - Single-frame unfreeze: No nested rAF delays
+ *   - Refreeze cooldown: Prevents rapid freeze/unfreeze cycling
+ *   - Better focusout: Uses relatedTarget + rAF fallback
  *
  * Layer 1 — Focus Pre-Freeze
- *   Listens for focusin on keyboard-triggering elements (textarea, input).
- *   Applies freeze CSS BEFORE the keyboard starts animating.
- *   This prevents the very first resize from causing layout thrashing.
+ *   Detects focusin/focusout on keyboard-triggering elements.
+ *   Applies freeze BEFORE keyboard starts animating.
+ *   SKIPS freeze when keyboard is already open (input-to-input switch).
  *
  * Layer 2 — Resize Suppression
- *   Capture-phase window.resize listener blocks ALL resize propagation
- *   while freeze is active.  This stops all 5 ST resize handlers
- *   (power-user.js, browser-fixes.js, AutoComplete, expressions, QuickReply)
- *   from running expensive operations during keyboard transition.
+ *   Capture-phase window.resize blocks propagation during freeze.
+ *   Prevents SillyTavern's 5+ resize handlers from running.
  *
  * Layer 3 — CSS Freeze (class-toggled, permanent stylesheet)
- *   A permanent <style> block whose rules activate only when
- *   body.perf-kb-freeze is present.  No inject/remove overhead.
- *   Disables transitions, animations, backdrop-filter on laggy elements.
- *   Also prevents browser-fixes.js fixFunkyPositioning from reflowing
- *   <html> by locking position: static !important.
+ *   body.perf-kb-freeze activates transition/animation/containment rules.
+ *   Relaxed containment (layout+style) so edit UIs can render.
+ *   No inject/remove overhead — just class toggle.
  *
  * Stability-based unfreeze:
- *   Instead of a fixed 280ms timeout, waits until the viewport height has
- *   remained stable for 250ms.  Adapts automatically to device speed.
+ *   Viewport must be stable for 100ms (down from 250ms).
+ *   Single rAF unfreeze (down from nested double rAF).
  *
  * Coordinates with other modules via:
- *   - body.perf-kb-freeze  (transitioning — CSS rules activate)
+ *   - body.perf-kb-freeze  (freeze active)
  *   - body.perf-kb-open    (keyboard visible)
- *   - CSS var --perf-kb-h  (keyboard height in px)
+ *   - CSS var --perf-kb-h   (keyboard height in px)
  *   - CustomEvent 'perf-keyboard-state' on document
+ *
+ * @version 4.0.0
  */
 
 const LOG = '[PerfOpt/MobileKB]';
-const STYLE_ID = 'perf-opt-kb-v3';
+const STYLE_ID = 'perf-opt-kb-v4';
 const FREEZE_CLASS = 'perf-kb-freeze';
 const OPEN_CLASS = 'perf-kb-open';
 
 /** Minimum viewport shrink to consider keyboard open (px). */
-const KB_THRESHOLD = 100;
+const KB_THRESHOLD = 80;
 
 /** Viewport must be stable for this long to unfreeze (ms). */
-const STABLE_MS = 250;
+const STABLE_MS = 100;
 
 /** Safety net — never freeze longer than this (ms). */
-const MAX_FREEZE_MS = 2000;
+const MAX_FREEZE_MS = 800;
 
 /** Maximum time to wait for keyboard after focus event (ms). */
-const FOCUS_TIMEOUT_MS = 600;
+const FOCUS_TIMEOUT_MS = 350;
+
+/** Minimum gap between unfreeze and next freeze (ms). */
+const REFREEZE_COOLDOWN_MS = 60;
 
 /** Selector for elements that trigger the virtual keyboard. */
 const KB_INPUT = [
@@ -62,21 +71,20 @@ const KB_INPUT = [
 ].join(',');
 
 // ─────────────────────────────────────────────────────────────────
-// Permanent freeze CSS — activated solely by body class toggle.
-// No <style> inject/remove (which itself causes style recalc).
-// Targets SPECIFIC lag-causing elements (never uses * selector).
+// Freeze CSS — activated solely by body class toggle.
+// v4: Relaxed containment (layout+style, not strict/paint) so
+//     edit textareas and other dynamic UI can render during freeze.
 // ─────────────────────────────────────────────────────────────────
 const FREEZE_CSS = `
-/* === PerfOptimizer: Keyboard Freeze (active when body.${FREEZE_CLASS}) === */
+/* === PerfOptimizer: Keyboard Freeze v4 === */
 
-/* Prevent browser-fixes.js fixFunkyPositioning from setting position:fixed
-   on <html>, which causes 2 forced layout recalculations per resize event. */
+/* Prevent browser-fixes.js fixFunkyPositioning from setting
+   position:fixed on <html> (causes 2 forced layouts per resize). */
 html.${FREEZE_CLASS} {
     position: static !important;
 }
 
-/* Disable transitions & animations on all major layout containers.
-   This list covers every element that has CSS transitions in ST. */
+/* Disable transitions & animations on major layout containers. */
 body.${FREEZE_CLASS} #bg1,
 body.${FREEZE_CLASS} #bg_custom,
 body.${FREEZE_CLASS} #sheld,
@@ -115,12 +123,15 @@ body.${FREEZE_CLASS} .popup-content {
     -webkit-backdrop-filter: none !important;
 }
 
-/* Strict containment during transition — browser skips child layout. */
+/* Relaxed containment — layout+style only.
+   v3 used "contain: strict" on #sheld which blocked edit UI rendering.
+   v4 uses layout+style which still prevents external reflows but
+   allows internal content (edit textareas) to render properly. */
 body.${FREEZE_CLASS} #sheld {
-    contain: strict;
+    contain: layout style;
 }
 body.${FREEZE_CLASS} #chat {
-    contain: layout style paint;
+    contain: layout style;
     overflow-anchor: none !important;
 }
 body.${FREEZE_CLASS} #form_sheld {
@@ -133,6 +144,12 @@ body.${FREEZE_CLASS} #right-nav-panel:not(.openDrawer),
 body.${FREEZE_CLASS} #left-nav-panel:not(.openDrawer) {
     content-visibility: hidden !important;
 }
+
+/* Ensure messages being edited can render even during freeze. */
+body.${FREEZE_CLASS} .mes[data-perf-editing="1"] {
+    contain: none !important;
+    content-visibility: visible !important;
+}
 `.trim();
 
 // ─────────────────────────────────────────────────────────────────
@@ -141,7 +158,7 @@ export class MobileKeyboardOptimizer {
     constructor() {
         this.active = false;
 
-        /** @type {boolean} Freeze CSS currently active */
+        /** @type {boolean} Freeze currently active */
         this._frozen = false;
         /** @type {boolean} Keyboard currently visible */
         this._kbOpen = false;
@@ -150,6 +167,8 @@ export class MobileKeyboardOptimizer {
         this._fullH = 0;
         /** @type {number} Last recorded viewport height */
         this._lastH = 0;
+        /** @type {number} Timestamp of last unfreeze */
+        this._lastUnfreezeTime = 0;
 
         // Timers
         /** @type {number|null} */ this._stableTimer = null;
@@ -193,7 +212,7 @@ export class MobileKeyboardOptimizer {
         this._bindResizeGuard();
 
         this.active = true;
-        console.log(`${LOG} v3 enabled (viewport: ${this._fullH}px)`);
+        console.log(`${LOG} v4 enabled (viewport: ${this._fullH}px)`);
     }
 
     disable() {
@@ -240,7 +259,7 @@ export class MobileKeyboardOptimizer {
     }
 
     // ================================================================
-    // Layer 1 — Focus Pre-Freeze
+    // Layer 1 — Focus Pre-Freeze (Smart Skip)
     // ================================================================
 
     /** @private */
@@ -249,10 +268,19 @@ export class MobileKeyboardOptimizer {
             const el = e.target;
             if (!el?.matches?.(KB_INPUT)) return;
 
+            // KEY v4 OPTIMIZATION: If keyboard is already open,
+            // this is just an input-to-input switch. No freeze needed.
+            // The keyboard is not animating, so no reflow occurs.
+            if (this._kbOpen) return;
+
             // Keyboard is about to open — pre-freeze
-            if (!this._kbOpen && !this._frozen) {
+            if (!this._frozen) {
+                // Cooldown: prevent rapid freeze/unfreeze cycling
+                if (performance.now() - this._lastUnfreezeTime < REFREEZE_COOLDOWN_MS) return;
                 this._freeze('focus-prewarm');
+
                 // Safety: unfreeze if keyboard never opens
+                clearTimeout(this._focusTimer);
                 this._focusTimer = setTimeout(() => {
                     if (!this._kbOpen && this._frozen) {
                         this._unfreeze();
@@ -266,10 +294,23 @@ export class MobileKeyboardOptimizer {
             const el = e.target;
             if (!el?.matches?.(KB_INPUT)) return;
 
-            // Keyboard will close — pre-freeze
-            if (this._kbOpen && !this._frozen) {
-                this._freeze('focus-blur');
-            }
+            // If focus is moving to another keyboard input, skip.
+            // relatedTarget gives us the next focused element.
+            const nextEl = e.relatedTarget;
+            if (nextEl?.matches?.(KB_INPUT)) return;
+
+            // relatedTarget can be null on some mobile browsers.
+            // Use rAF as fallback to verify after focusin fires.
+            requestAnimationFrame(() => {
+                // Double-check: if activeElement is a keyboard input, skip
+                if (document.activeElement?.matches?.(KB_INPUT)) return;
+
+                // Keyboard will close — pre-freeze
+                if (this._kbOpen && !this._frozen) {
+                    if (performance.now() - this._lastUnfreezeTime < REFREEZE_COOLDOWN_MS) return;
+                    this._freeze('focus-blur');
+                }
+            });
         };
 
         document.addEventListener('focusin', this._onFocusIn, { passive: true });
@@ -280,11 +321,7 @@ export class MobileKeyboardOptimizer {
     // Layer 2 — Resize Suppression
     // ================================================================
 
-    /**
-     * @private
-     * Capture-phase guard.  Fires before ANY other resize handler.
-     * While frozen, prevents all 5 ST resize handlers from running.
-     */
+    /** @private */
     _bindResizeGuard() {
         this._onResizeCapture = (e) => {
             if (this._frozen) {
@@ -362,28 +399,27 @@ export class MobileKeyboardOptimizer {
 
     /**
      * @private
-     * Each viewport change resets the timer.  Only when stable for
-     * STABLE_MS do we consider the transition finished and unfreeze.
+     * Each viewport change resets the timer. Only when stable for
+     * STABLE_MS do we consider the transition finished.
      */
     _resetStableTimer() {
         clearTimeout(this._stableTimer);
         this._stableTimer = setTimeout(() => {
             this._stableTimer = null;
-            this._onTransitionStable();
+            this._onStable();
         }, STABLE_MS);
     }
 
-    /** @private */
-    _onTransitionStable() {
+    /**
+     * @private
+     * v4: Single-frame unfreeze (v3 used nested double rAF = 2 extra frames).
+     * Save scroll → unfreeze → restore scroll in one rAF.
+     */
+    _onStable() {
         this._saveScrollPos();
-
-        // Unfreeze at a clean paint boundary
         requestAnimationFrame(() => {
             this._unfreeze();
-            // One more frame to let layout settle then restore scroll
-            requestAnimationFrame(() => {
-                this._restoreScrollPos();
-            });
+            this._restoreScrollPos();
         });
     }
 
@@ -413,10 +449,11 @@ export class MobileKeyboardOptimizer {
         }, MAX_FREEZE_MS);
     }
 
-    /** @private Remove freeze. */
+    /** @private Remove freeze and record timestamp. */
     _unfreeze() {
         if (!this._frozen) return;
         this._frozen = false;
+        this._lastUnfreezeTime = performance.now();
 
         document.body?.classList.remove(FREEZE_CLASS);
         document.documentElement?.classList.remove(FREEZE_CLASS);
@@ -451,6 +488,9 @@ export class MobileKeyboardOptimizer {
 
     /** @private Inject once, never removed (toggled by class). */
     _injectPermanentCSS() {
+        // Remove v3 style if upgrading
+        document.getElementById('perf-opt-kb-v3')?.remove();
+
         if (document.getElementById(STYLE_ID)) return;
         this._styleEl = document.createElement('style');
         this._styleEl.id = STYLE_ID;
