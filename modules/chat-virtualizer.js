@@ -105,7 +105,7 @@ export class ChatVirtualizer {
         this._initialTimer = setTimeout(() => {
             this._initialTimer = null;
             this._processExisting();
-        }, 500);
+        }, 1200);
 
         this.active = true;
         console.log('[PerfOptimizer/ChatVirt] v2 enabled');
@@ -262,9 +262,10 @@ export class ChatVirtualizer {
             requestAnimationFrame(() => {
                 const wasAtBottom = this._isAtBottom();
                 this._bulkDehydrate();
-                if (wasAtBottom) {
-                    this._scrollToBottom();
-                }
+                // Always scroll to bottom after bulk load (chat switch / initial load)
+                this._scrollToBottom();
+                // Double-ensure after content-visibility reflow
+                requestAnimationFrame(() => this._scrollToBottom());
             });
         });
     }
@@ -324,12 +325,11 @@ export class ChatVirtualizer {
     _processExisting() {
         const messages = this._chatContainer.querySelectorAll('.mes');
         if (messages.length >= this.options.bulkLoadThreshold) {
-            const wasAtBottom = this._isAtBottom();
             this._bulkDehydrate();
             // Always scroll to bottom on initial load to match ST's behavior
-            if (wasAtBottom) {
-                this._scrollToBottom();
-            }
+            this._scrollToBottom();
+            // Double-ensure after reflow completes
+            requestAnimationFrame(() => this._scrollToBottom());
         } else {
             // Small chat: just mark tail as visible
             const tailStart = Math.max(0, messages.length - this.options.alwaysVisibleTail);

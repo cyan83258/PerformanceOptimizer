@@ -1097,7 +1097,7 @@ function updateStatus() {
 // ===================================================================
 
 jQuery(async () => {
-    console.log(`${LOG_PREFIX} Initializing... [BUILD:20260221c]`);
+    console.log(`${LOG_PREFIX} Initializing... [BUILD:20260221d]`);
 
     try {
         // 1. Load/initialize settings
