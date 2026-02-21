@@ -33,9 +33,9 @@
 
 const DEFAULT_OPTIONS = {
     /** Extra messages to keep hydrated above/below viewport */
-    bufferSize: 5,
+    bufferSize: 2,
     /** Always keep the last N messages hydrated */
-    alwaysVisibleTail: 10,
+    alwaysVisibleTail: 3,
     /** Minimum messages added in a batch to trigger bulk dehydration */
     bulkLoadThreshold: 15,
 };
@@ -66,6 +66,8 @@ export class ChatVirtualizer {
         this._dehydrateTimer = null;
         /** @type {number|null} */
         this._bulkTimer = null;
+        /** @type {number|null} */
+        this._initialTimer = null;
 
         /** @type {Function|null} */
         this._scrollHandler = null;
@@ -95,7 +97,15 @@ export class ChatVirtualizer {
         this._setupIntersectionObserver();
         this._setupMutationObserver();
         this._setupScrollTracker();
-        this._processExisting();
+
+        // IMPORTANT: Delay initial processing so SillyTavern's own
+        // scrollChatToBottom() can finish first. If we dehydrate immediately,
+        // message heights change before the scroll-to-bottom completes,
+        // leaving the user stranded at the top of the chat.
+        this._initialTimer = setTimeout(() => {
+            this._initialTimer = null;
+            this._processExisting();
+        }, 500);
 
         this.active = true;
         console.log('[PerfOptimizer/ChatVirt] v2 enabled');
@@ -116,8 +126,10 @@ export class ChatVirtualizer {
 
         clearTimeout(this._dehydrateTimer);
         clearTimeout(this._bulkTimer);
+        clearTimeout(this._initialTimer);
         this._dehydrateTimer = null;
         this._bulkTimer = null;
+        this._initialTimer = null;
 
         this._rehydrateAll();
         this._visibleSet.clear();
@@ -227,6 +239,8 @@ export class ChatVirtualizer {
                 this._bulkTimer = setTimeout(() => {
                     if (count >= this.options.bulkLoadThreshold) {
                         this._onBulkLoad();
+                    } else {
+                        this._trimOnNewMessage();
                     }
                     pendingCount = 0;
                 }, 150);
@@ -239,15 +253,67 @@ export class ChatVirtualizer {
     /**
      * @private
      * Called when a bulk load of messages is detected.
-     * Waits two frames for ST's scrollChatToBottom to settle.
+     * Waits two frames for ST's scrollChatToBottom to settle,
+     * then dehydrates and restores scroll position.
      */
     _onBulkLoad() {
         if (this._processingBulk) return;
         requestAnimationFrame(() => {
             requestAnimationFrame(() => {
+                const wasAtBottom = this._isAtBottom();
                 this._bulkDehydrate();
+                if (wasAtBottom) {
+                    this._scrollToBottom();
+                }
             });
         });
+    }
+
+    // ==================================================================
+    // Auto-Trim: Dehydrate excess top messages on new arrivals
+    // ==================================================================
+
+    /**
+     * @private
+     * Called after normal (non-bulk) message additions.
+     * Enforces the hydration budget by dehydrating oldest messages from
+     * the top. Budget = alwaysVisibleTail + bufferSize * 2.
+     */
+    _trimOnNewMessage() {
+        if (!this._chatContainer || this._processingBulk) return;
+
+        const messages = this._chatContainer.querySelectorAll('.mes');
+        const total = messages.length;
+        const maxHydrated = this.options.alwaysVisibleTail + this.options.bufferSize * 2;
+
+        if (total <= maxHydrated) return;
+
+        // Count currently hydrated messages
+        let hydratedCount = 0;
+        for (const mes of messages) {
+            if (!mes.hasAttribute(DEHYDRATED_ATTR)) hydratedCount++;
+        }
+
+        let excess = hydratedCount - maxHydrated;
+        if (excess <= 0) return;
+
+        // Dehydrate from the top, skipping visible/editing messages
+        let trimmed = 0;
+        for (const mes of messages) {
+            if (excess <= 0) break;
+            if (mes.hasAttribute(DEHYDRATED_ATTR)) continue;
+            if (mes.classList.contains('last_mes')) continue;
+            if (this._visibleSet.has(mes)) continue;
+            if (mes.querySelector('.mes_edit_buttons:not([style*="display: none"])')) continue;
+
+            this._dehydrate(mes);
+            excess--;
+            trimmed++;
+        }
+
+        if (trimmed > 0) {
+            console.log(`[PerfOptimizer/ChatVirt] Auto-trimmed ${trimmed} top messages`);
+        }
     }
 
     // ==================================================================
@@ -258,7 +324,12 @@ export class ChatVirtualizer {
     _processExisting() {
         const messages = this._chatContainer.querySelectorAll('.mes');
         if (messages.length >= this.options.bulkLoadThreshold) {
+            const wasAtBottom = this._isAtBottom();
             this._bulkDehydrate();
+            // Always scroll to bottom on initial load to match ST's behavior
+            if (wasAtBottom) {
+                this._scrollToBottom();
+            }
         } else {
             // Small chat: just mark tail as visible
             const tailStart = Math.max(0, messages.length - this.options.alwaysVisibleTail);
@@ -407,5 +478,32 @@ export class ChatVirtualizer {
         for (const mes of this._chatContainer.querySelectorAll(`[${DEHYDRATED_ATTR}]`)) {
             this._hydrate(mes);
         }
+    }
+
+    // ==================================================================
+    // Scroll Position Helpers
+    // ==================================================================
+
+    /**
+     * @private
+     * Check if the chat container is scrolled to (or near) the bottom.
+     * "Near bottom" means within 150px of the end, which accounts for
+     * minor rendering differences.
+     * @returns {boolean}
+     */
+    _isAtBottom() {
+        if (!this._chatContainer) return true;
+        const { scrollTop, scrollHeight, clientHeight } = this._chatContainer;
+        return scrollHeight - scrollTop - clientHeight < 150;
+    }
+
+    /**
+     * @private
+     * Scroll the chat container to the very bottom.
+     * Uses instant scroll (no smooth animation) to avoid visible lag.
+     */
+    _scrollToBottom() {
+        if (!this._chatContainer) return;
+        this._chatContainer.scrollTop = this._chatContainer.scrollHeight;
     }
 }

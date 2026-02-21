@@ -13,13 +13,16 @@
  *   - Avatar Cache:         In-memory blob URL caching for avatar images
  *   - Frame Optimizer:      Layout thrashing prevention, DOM read/write batching
  *   - Network Batcher:      GET request caching and deduplication
- *   - Mobile Keyboard:      Prevents layout thrashing on virtual keyboard open/close
- *   - Mobile Layout:        Stabilizes dvh/vh heights, CSS containment, GPU promotion
- *   - Mobile Touch:         Input responsiveness, tap delay removal, scroll optimization
+ *   - Mobile Keyboard:      Prevents layout thrashing on virtual keyboard open/close (v4)
+ *   - Mobile Layout:        Stabilizes dvh/vh heights, CSS containment
+ *   - Mobile Touch:         Tap delay removal, scroll optimization (v2)
+ *   - Mobile Render:        Panel hibernation, GPU promotion, idle cleanup
+ *   - Mobile Input:         Edit-mode optimization, textarea resize batching
+ *   - Message Content:      CSS containment, lazy images, long message collapsing
  *
  * Each module can be toggled independently from the extension settings panel.
  *
- * @version 3.0.0
+ * @version 4.0.0
  */
 
 const MODULE_NAME = 'SillyTavern-PerformanceOptimizer';
@@ -49,8 +52,8 @@ const DEFAULT_SETTINGS = {
     },
     chatVirtualizer: {
         enabled: true,
-        bufferSize: 5,
-        alwaysVisibleTail: 10,
+        bufferSize: 2,
+        alwaysVisibleTail: 3,
     },
     promptOptimizer: {
         enabled: true,
@@ -78,6 +81,13 @@ const DEFAULT_SETTINGS = {
     },
     mobileRender: {
         enabled: true,
+    },
+    mobileInput: {
+        enabled: true,
+    },
+    messageContent: {
+        enabled: true,
+        collapseThresholdPx: 600,
     },
 };
 
@@ -127,6 +137,10 @@ let mobileLayout = null;
 let mobileTouch = null;
 /** @type {import('./modules/mobile-render-optimizer.js').MobileRenderOptimizer|null} */
 let mobileRender = null;
+/** @type {import('./modules/mobile-input-optimizer.js').MobileInputOptimizer|null} */
+let mobileInput = null;
+/** @type {import('./modules/message-content-optimizer.js').MessageContentOptimizer|null} */
+let messageContentOptimizer = null;
 
 // ===================================================================
 // Settings Management
@@ -150,6 +164,14 @@ function loadSettings() {
             if (!(key in s)) {
                 s[key] = structuredClone(value);
                 migrated = true;
+            } else if (typeof value === 'object' && value !== null && typeof s[key] === 'object') {
+                // Merge missing sub-keys for existing modules
+                for (const [subKey, subValue] of Object.entries(value)) {
+                    if (!(subKey in s[key])) {
+                        s[key][subKey] = structuredClone(subValue);
+                        migrated = true;
+                    }
+                }
             }
         }
         if (migrated) ctx.saveSettingsDebounced();
@@ -193,7 +215,7 @@ async function initModules() {
         cssMod, settingsMod, domMod, scrollMod,
         chatVirtMod, promptMod, bgMod, avatarMod, frameMod, netMod,
         mobileKbMod, mobileLayoutMod, mobileTouchMod,
-        mobileRenderMod,
+        mobileRenderMod, mobileInputMod, msgContentMod,
     ] = await Promise.all([
         safeImport('./modules/css-optimizer.js'),
         safeImport('./modules/settings-optimizer.js'),
@@ -208,6 +230,9 @@ async function initModules() {
         safeImport('./modules/mobile-keyboard-optimizer.js'),
         safeImport('./modules/mobile-layout-stabilizer.js'),
         safeImport('./modules/mobile-touch-optimizer.js'),
+        safeImport('./modules/mobile-render-optimizer.js'),
+        safeImport('./modules/mobile-input-optimizer.js'),
+        safeImport('./modules/message-content-optimizer.js'),
     ]);
 
     if (cssMod?.CSSOptimizer) {
@@ -252,6 +277,12 @@ async function initModules() {
     if (mobileRenderMod?.MobileRenderOptimizer) {
         mobileRender = new mobileRenderMod.MobileRenderOptimizer();
     }
+    if (mobileInputMod?.MobileInputOptimizer) {
+        mobileInput = new mobileInputMod.MobileInputOptimizer();
+    }
+    if (msgContentMod?.MessageContentOptimizer) {
+        messageContentOptimizer = new msgContentMod.MessageContentOptimizer();
+    }
 
     const loaded = [
         cssOptimizer && 'CSS',
@@ -268,6 +299,8 @@ async function initModules() {
         mobileLayout && 'MobileLayout',
         mobileTouch && 'MobileTouch',
         mobileRender && 'MobileRender',
+        mobileInput && 'MobileInput',
+        messageContentOptimizer && 'MsgContent',
     ].filter(Boolean);
 
     console.log(`${LOG_PREFIX} Modules loaded: ${loaded.join(', ')}`);
@@ -325,6 +358,10 @@ function applyOptimizations() {
     // Chat Virtualizer
     if (chatVirtualizer) {
         if (settings.chatVirtualizer.enabled) {
+            chatVirtualizer.update({
+                bufferSize: settings.chatVirtualizer.bufferSize,
+                alwaysVisibleTail: settings.chatVirtualizer.alwaysVisibleTail,
+            });
             chatVirtualizer.enable();
         } else {
             chatVirtualizer.disable();
@@ -412,6 +449,27 @@ function applyOptimizations() {
         }
     }
 
+    // Mobile Input Optimizer
+    if (mobileInput) {
+        if (settings.mobileInput.enabled) {
+            mobileInput.enable();
+        } else {
+            mobileInput.disable();
+        }
+    }
+
+    // Message Content Optimizer
+    if (messageContentOptimizer) {
+        if (settings.messageContent.enabled) {
+            messageContentOptimizer.update({
+                collapseThresholdPx: settings.messageContent.collapseThresholdPx,
+            });
+            messageContentOptimizer.enable();
+        } else {
+            messageContentOptimizer.disable();
+        }
+    }
+
     console.log(`${LOG_PREFIX} Optimizations applied.`);
 }
 
@@ -431,6 +489,8 @@ function disableAll() {
     mobileLayout?.disable();
     mobileTouch?.disable();
     mobileRender?.disable();
+    mobileInput?.disable();
+    messageContentOptimizer?.disable();
 }
 
 // ===================================================================
@@ -530,6 +590,18 @@ function createSettingsPanel() {
                         <input type="checkbox" id="perf_opt_chatvirt" ${checked(settings.chatVirtualizer.enabled)} />
                     </div>
                     <div class="perf-opt-subtitle">\uD654\uBA74 \uBC16 \uBA54\uC2DC\uC9C0\uB97C \uC228\uACA8 DOM \uBD80\uD558\uB97C \uB300\uD3ED \uC904\uC785\uB2C8\uB2E4</div>
+
+                    <div style="display:flex; flex-direction:column; align-items:stretch; gap:2px; margin:8px 0; padding:4px; border:1px solid rgba(255,255,255,0.1); border-radius:4px;">
+                        <small style="opacity:0.8;">\uD56D\uC0C1 \uD65C\uC131 \uBA54\uC2DC\uC9C0 \uC218 (\uD558\uB2E8): <strong id="perf_opt_chatvirt_tail_display">${settings.chatVirtualizer.alwaysVisibleTail}</strong></small>
+                        <input type="range" id="perf_opt_chatvirt_tail" min="1" max="30" step="1" value="${settings.chatVirtualizer.alwaysVisibleTail}" style="display:block !important; width:100% !important; height:20px !important; cursor:pointer;" />
+                    </div>
+
+                    <div style="display:flex; flex-direction:column; align-items:stretch; gap:2px; margin:8px 0; padding:4px; border:1px solid rgba(255,255,255,0.1); border-radius:4px;">
+                        <small style="opacity:0.8;">\uBC84\uD37C \uBA54\uC2DC\uC9C0 \uC218 (\uC0C1/\uD558): <strong id="perf_opt_chatvirt_buffer_display">${settings.chatVirtualizer.bufferSize}</strong></small>
+                        <input type="range" id="perf_opt_chatvirt_buffer" min="0" max="10" step="1" value="${settings.chatVirtualizer.bufferSize}" style="display:block !important; width:100% !important; height:20px !important; cursor:pointer;" />
+                    </div>
+
+                    <div class="perf-opt-subtitle" style="font-size:0.78em; opacity:0.7">\uBA54\uC2DC\uC9C0\uAC00 \uAE38\uBA74(2\uB9CC \uD1A0\uD070+) \uAC12\uC744 \uB0AE\uCD94\uC138\uC694. \uAE30\uBCF8: \uD65C\uC131 3 / \uBC84\uD37C 2</div>
                 </div>
 
                 <!-- Prompt Optimizer -->
@@ -592,11 +664,11 @@ function createSettingsPanel() {
                 <div class="perf-opt-section" id="perf_opt_mobilekb_section">
                     <div class="perf-opt-toggle">
                         <label for="perf_opt_mobilekb">
-                            <b>📱 모바일 키보드 최적화</b>
+                            <b>\u{1F4F1} \uBAA8\uBC14\uC77C \uD0A4\uBCF4\uB4DC \uCD5C\uC801\uD654</b>
                         </label>
                         <input type="checkbox" id="perf_opt_mobilekb" ${checked(settings.mobileKeyboard.enabled)} />
                     </div>
-                    <div class="perf-opt-subtitle">키보드 열기/닫기 시 레이아웃 재계산을 방지합니다</div>
+                    <div class="perf-opt-subtitle">\uD0A4\uBCF4\uB4DC \uC5F4\uAE30/\uB2EB\uAE30 \uC2DC \uB808\uC774\uC544\uC6C3 \uC7AC\uACC4\uC0B0\uC744 \uBC29\uC9C0\uD569\uB2C8\uB2E4 (v4: \uC18D\uB3C4 \uAC1C\uC120)</div>
                 </div>
 
 
@@ -604,33 +676,62 @@ function createSettingsPanel() {
                 <div class="perf-opt-section" id="perf_opt_mobilelayout_section">
                     <div class="perf-opt-toggle">
                         <label for="perf_opt_mobilelayout">
-                            <b>📐 모바일 레이아웃 안정화</b>
+                            <b>\u{1F4D0} \uBAA8\uBC14\uC77C \uB808\uC774\uC544\uC6C3 \uC548\uC815\uD654</b>
                         </label>
                         <input type="checkbox" id="perf_opt_mobilelayout" ${checked(settings.mobileLayout.enabled)} />
                     </div>
-                    <div class="perf-opt-subtitle">dvh/vh 높이를 고정하여 키보드에 의한 레이아웃 재계산을 원천 차단합니다</div>
+                    <div class="perf-opt-subtitle">dvh/vh \uB192\uC774\uB97C \uACE0\uC815\uD558\uC5EC \uD0A4\uBCF4\uB4DC\uC5D0 \uC758\uD55C \uB808\uC774\uC544\uC6C3 \uC7AC\uACC4\uC0B0\uC744 \uC6D0\uCC9C \uCC28\uB2E8\uD569\uB2C8\uB2E4</div>
                 </div>
 
                 <!-- Mobile Touch Optimizer -->
                 <div class="perf-opt-section" id="perf_opt_mobiletouch_section">
                     <div class="perf-opt-toggle">
                         <label for="perf_opt_mobiletouch">
-                            <b>🤟 모바일 터치 최적화</b>
+                            <b>\u{1F91F} \uBAA8\uBC14\uC77C \uD130\uCE58 \uCD5C\uC801\uD654</b>
                         </label>
                         <input type="checkbox" id="perf_opt_mobiletouch" ${checked(settings.mobileTouch.enabled)} />
                     </div>
-                    <div class="perf-opt-subtitle">탭 딜레이 제거, 스크롤 최적화, 입력 반응성을 개선합니다</div>
+                    <div class="perf-opt-subtitle">\uD0ED \uB51C\uB808\uC774 \uC81C\uAC70, \uC2A4\uD06C\uB864 \uCD5C\uC801\uD654, \uC785\uB825 \uBC18\uC751\uC131\uC744 \uAC1C\uC120\uD569\uB2C8\uB2E4</div>
                 </div>
 
                 <!-- Mobile Render Optimizer -->
                 <div class="perf-opt-section" id="perf_opt_mobilerender_section">
                     <div class="perf-opt-toggle">
                         <label for="perf_opt_mobilerender">
-                            <b>🖥️ 모바일 렌더링 최적화</b>
+                            <b>\u{1F3AC} \uBAA8\uBC14\uC77C \uB80C\uB354\uB9C1 \uCD5C\uC801\uD654</b>
                         </label>
                         <input type="checkbox" id="perf_opt_mobilerender" ${checked(settings.mobileRender.enabled)} />
                     </div>
-                    <div class="perf-opt-subtitle">GPU 가속, 패널 히비네이션, 레이아웃 쓰로틀링으로 마이크로렉을 제거합니다</div>
+                    <div class="perf-opt-subtitle">\uD328\uB110 \uD558\uC774\uBC84\uB124\uC774\uC158, GPU \uB808\uC774\uC5B4 \uC2B9\uACA9, \uC720\uD734 \uC2DC DOM \uC815\uB9AC\uB97C \uC218\uD589\uD569\uB2C8\uB2E4</div>
+                </div>
+
+                <!-- Mobile Input Optimizer -->
+                <div class="perf-opt-section" id="perf_opt_mobileinput_section">
+                    <div class="perf-opt-toggle">
+                        <label for="perf_opt_mobileinput">
+                            <b>\u270F\uFE0F \uBAA8\uBC14\uC77C \uC785\uB825 \uCD5C\uC801\uD654</b>
+                        </label>
+                        <input type="checkbox" id="perf_opt_mobileinput" ${checked(settings.mobileInput.enabled)} />
+                    </div>
+                    <div class="perf-opt-subtitle">\uCC44\uD305 \uC218\uC815 \uC9C4\uC785 \uC2DC \uB809 \uBC29\uC9C0, \uD14D\uC2A4\uD2B8 \uC785\uB825 \uCD5C\uC801\uD654\uB97C \uC218\uD589\uD569\uB2C8\uB2E4</div>
+                </div>
+
+                <!-- Message Content Optimizer -->
+                <div class="perf-opt-section" id="perf_opt_msgcontent_section">
+                    <div class="perf-opt-toggle">
+                        <label for="perf_opt_msgcontent">
+                            <b>\u{1F4E6} \uBA54\uC2DC\uC9C0 \uCF58\uD150\uCE20 \uCD5C\uC801\uD654</b>
+                        </label>
+                        <input type="checkbox" id="perf_opt_msgcontent" ${checked(settings.messageContent.enabled)} />
+                    </div>
+                    <div class="perf-opt-subtitle">\uAE34 \uBA54\uC2DC\uC9C0 \uC811\uAE30, CSS \uACA9\uB9AC, \uC774\uBBF8\uC9C0 \uC9C0\uC5F0\uB85C\uB529\uC73C\uB85C \uBC84\uD37C\uB9C1\uC744 \uC904\uC785\uB2C8\uB2E4</div>
+
+                    <div style="display:flex; flex-direction:column; align-items:stretch; gap:2px; margin:8px 0; padding:4px; border:1px solid rgba(255,255,255,0.1); border-radius:4px;">
+                        <small style="opacity:0.8;">\uC811\uAE30 \uAE30\uC900 \uB192\uC774 (px): <strong id="perf_opt_msgcontent_threshold_display">${settings.messageContent.collapseThresholdPx}</strong></small>
+                        <input type="range" id="perf_opt_msgcontent_threshold" min="0" max="3000" step="100" value="${settings.messageContent.collapseThresholdPx}" style="display:block !important; width:100% !important; height:20px !important; cursor:pointer;" />
+                    </div>
+
+                    <div class="perf-opt-subtitle" style="font-size:0.78em; opacity:0.7">0\uC73C\uB85C \uC124\uC815\uD558\uBA74 \uC811\uAE30 \uBE44\uD65C\uC131\uD654. \uAE30\uBCF8: 600px</div>
                 </div>
 
                 <hr />
@@ -733,6 +834,30 @@ function bindEvents() {
         updateStatus();
     });
 
+    // Chat Virtualizer - alwaysVisibleTail
+    $('#perf_opt_chatvirt_tail').on('input', function () {
+        $('#perf_opt_chatvirt_tail_display').text(this.value);
+    }).on('change', function () {
+        const val = Math.max(1, Math.min(30, parseInt(this.value, 10) || 3));
+        this.value = val;
+        $('#perf_opt_chatvirt_tail_display').text(val);
+        getSettings().chatVirtualizer.alwaysVisibleTail = val;
+        saveSettings();
+        applyOptimizations();
+    });
+
+    // Chat Virtualizer - bufferSize
+    $('#perf_opt_chatvirt_buffer').on('input', function () {
+        $('#perf_opt_chatvirt_buffer_display').text(this.value);
+    }).on('change', function () {
+        const val = Math.max(0, Math.min(10, parseInt(this.value, 10) || 2));
+        this.value = val;
+        $('#perf_opt_chatvirt_buffer_display').text(val);
+        getSettings().chatVirtualizer.bufferSize = val;
+        saveSettings();
+        applyOptimizations();
+    });
+
     // Prompt Optimizer toggle
     $('#perf_opt_promptopt').on('change', function () {
         getSettings().promptOptimizer.enabled = this.checked;
@@ -805,6 +930,34 @@ function bindEvents() {
         updateStatus();
     });
 
+    // Mobile Input Optimizer toggle
+    $('#perf_opt_mobileinput').on('change', function () {
+        getSettings().mobileInput.enabled = this.checked;
+        saveSettings();
+        applyOptimizations();
+        updateStatus();
+    });
+
+    // Message Content Optimizer toggle
+    $('#perf_opt_msgcontent').on('change', function () {
+        getSettings().messageContent.enabled = this.checked;
+        saveSettings();
+        applyOptimizations();
+        updateStatus();
+    });
+
+    // Message Content Optimizer - collapseThresholdPx
+    $('#perf_opt_msgcontent_threshold').on('input', function () {
+        $('#perf_opt_msgcontent_threshold_display').text(this.value);
+    }).on('change', function () {
+        const val = Math.max(0, Math.min(3000, parseInt(this.value, 10) || 600));
+        this.value = val;
+        $('#perf_opt_msgcontent_threshold_display').text(val);
+        getSettings().messageContent.collapseThresholdPx = val;
+        saveSettings();
+        applyOptimizations();
+    });
+
     // Apply button
     $('#perf_opt_apply').on('click', () => {
         applyOptimizations();
@@ -848,6 +1001,10 @@ function syncUIFromSettings() {
     $('#perf_opt_dom').prop('checked', s.domOptimizer.enabled);
     $('#perf_opt_scroll').prop('checked', s.scrollOptimizer.enabled);
     $('#perf_opt_chatvirt').prop('checked', s.chatVirtualizer.enabled);
+    $('#perf_opt_chatvirt_tail').val(s.chatVirtualizer.alwaysVisibleTail);
+    $('#perf_opt_chatvirt_tail_display').text(s.chatVirtualizer.alwaysVisibleTail);
+    $('#perf_opt_chatvirt_buffer').val(s.chatVirtualizer.bufferSize);
+    $('#perf_opt_chatvirt_buffer_display').text(s.chatVirtualizer.bufferSize);
     $('#perf_opt_promptopt').prop('checked', s.promptOptimizer.enabled);
     $('#perf_opt_bgopt').prop('checked', s.bgOptimizer.enabled);
     $('#perf_opt_avatar').prop('checked', s.avatarCache.enabled);
@@ -857,6 +1014,10 @@ function syncUIFromSettings() {
     $('#perf_opt_mobilelayout').prop('checked', s.mobileLayout.enabled);
     $('#perf_opt_mobiletouch').prop('checked', s.mobileTouch.enabled);
     $('#perf_opt_mobilerender').prop('checked', s.mobileRender.enabled);
+    $('#perf_opt_mobileinput').prop('checked', s.mobileInput.enabled);
+    $('#perf_opt_msgcontent').prop('checked', s.messageContent.enabled);
+    $('#perf_opt_msgcontent_threshold').val(s.messageContent.collapseThresholdPx);
+    $('#perf_opt_msgcontent_threshold_display').text(s.messageContent.collapseThresholdPx);
 }
 
 /** Enable/disable section UI based on master toggle. */
@@ -877,6 +1038,8 @@ function updateSectionStates() {
         '#perf_opt_mobilelayout_section',
         '#perf_opt_mobiletouch_section',
         '#perf_opt_mobilerender_section',
+        '#perf_opt_mobileinput_section',
+        '#perf_opt_msgcontent_section',
     ];
     for (const sel of sections) {
         if (enabled) {
@@ -918,7 +1081,9 @@ function updateStatus() {
     if (settings.mobileKeyboard.enabled) parts.push('\uBAA8\uBC14\uC77C\uD0A4\uBCF4\uB4DC');
     if (settings.mobileLayout.enabled) parts.push('\uBAA8\uBC14\uC77C\uB808\uC774\uC544\uC6C3');
     if (settings.mobileTouch.enabled) parts.push('\uBAA8\uBC14\uC77C\uD130\uCE58');
-    if (settings.mobileRender.enabled) parts.push('\uBAA8\uBC14\uC77C\uB80C\uB354\uB9C1');
+    if (settings.mobileRender.enabled) parts.push('\uBAA8\uBC14\uC77C\uB80C\uB354');
+    if (settings.mobileInput.enabled) parts.push('\uBAA8\uBC14\uC77C\uC785\uB825');
+    if (settings.messageContent.enabled) parts.push('\uBA54\uC2DC\uC9C0\uCF58\uD150\uCE20');
 
     const text = parts.length > 0
         ? `\uC0C1\uD0DC: \uD65C\uC131\uD654 \u2014 ${parts.join(' | ')}`
@@ -932,7 +1097,7 @@ function updateStatus() {
 // ===================================================================
 
 jQuery(async () => {
-    console.log(`${LOG_PREFIX} Initializing...`);
+    console.log(`${LOG_PREFIX} Initializing... [BUILD:20260221b]`);
 
     try {
         // 1. Load/initialize settings
