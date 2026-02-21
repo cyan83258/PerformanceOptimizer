@@ -2,7 +2,7 @@
  * Mobile Render Optimizer Module
  *
  * Tackles general mobile micro-lag by reducing rendering overhead
- * at the browser engine level. Complements existing mobile modules
+ * at the browser engine level. Complements other mobile modules
  * (keyboard, layout, touch) with render-pipeline-specific fixes.
  *
  * Optimizations:
@@ -13,18 +13,20 @@
  *      - content-visibility: hidden on closed drawers/panels
  *      - MutationObserver detects open/close state changes
  *      - Hidden panels produce zero rendering cost
- *   3. Resize Throttle
- *      - rAF-gated window resize events
- *      - Prevents cascading layout recalculations from rapid resize
- *   4. Paint Containment
+ *   3. Paint Containment
  *      - contain: strict on non-visible subtrees
  *      - contain: layout style paint on message elements
- *   5. Idle-Time Cleanup
+ *   4. Idle-Time Cleanup
  *      - requestIdleCallback for non-critical DOM housekeeping
- *      - Removes detached nodes, empty text nodes from #chat
- *   6. Reduced Transitions
+ *      - Removes empty text nodes from #chat
+ *   5. Reduced Transitions
  *      - Disables non-essential CSS transitions on mobile
  *      - Removes hover-triggered effects (irrelevant on touch)
+ *
+ * NOTE: Resize throttling is handled by the keyboard optimizer
+ * (which has a more sophisticated freeze/unfreeze mechanism).
+ * This module intentionally does NOT intercept resize events
+ * to avoid conflicts.
  *
  * Mobile detection: window.innerWidth <= 1000px
  * All changes are fully reversible on disable().
@@ -95,9 +97,6 @@ export class MobileRenderOptimizer {
         /** @type {MutationObserver|null} */
         this._drawerObserver = null;
 
-        /** @type {Function|null} */
-        this._resizeHandler = null;
-
         /** @type {number|null} */
         this._idleCallbackId = null;
 
@@ -120,7 +119,6 @@ export class MobileRenderOptimizer {
         }
 
         this._injectStyles();
-        this._setupResizeThrottle();
         this._setupDrawerObserver();
         this._setupIdleCleanup();
         this._promoteGPULayers();
@@ -147,12 +145,6 @@ export class MobileRenderOptimizer {
         if (this._drawerObserver) {
             this._drawerObserver.disconnect();
             this._drawerObserver = null;
-        }
-
-        // Remove resize handler
-        if (this._resizeHandler) {
-            window.removeEventListener('resize', this._resizeHandler, true);
-            this._resizeHandler = null;
         }
 
         // Cancel idle callback
@@ -220,34 +212,7 @@ export class MobileRenderOptimizer {
     }
 
     // ==================================================================
-    // 3. Resize Throttle
-    // ==================================================================
-
-    /**
-     * @private
-     * Throttle resize events to one-per-frame using rAF gating.
-     * This prevents cascading layout recalculations when the viewport
-     * changes (e.g., address bar show/hide on mobile).
-     */
-    _setupResizeThrottle() {
-        let throttled = false;
-
-        this._resizeHandler = (e) => {
-            if (throttled) {
-                e.stopImmediatePropagation();
-                return;
-            }
-            throttled = true;
-            requestAnimationFrame(() => {
-                throttled = false;
-            });
-        };
-
-        window.addEventListener('resize', this._resizeHandler, { capture: true });
-    }
-
-    // ==================================================================
-    // 4. Drawer Observer (Panel Hibernation)
+    // 3. Drawer Observer (Panel Hibernation)
     // ==================================================================
 
     /**
@@ -268,7 +233,7 @@ export class MobileRenderOptimizer {
                 const isOpen = el.classList.contains('openDrawer') || el.classList.contains('open');
 
                 if (isOpen) {
-                    // Drawer just opened - ensure smooth rendering
+                    // Drawer just opened — ensure smooth rendering
                     const content = el.querySelector('.drawer-content') || el;
                     content.style.contentVisibility = '';
                 }
@@ -284,14 +249,13 @@ export class MobileRenderOptimizer {
     }
 
     // ==================================================================
-    // 5. Idle-Time Cleanup
+    // 4. Idle-Time Cleanup
     // ==================================================================
 
     /**
      * @private
      * Schedule non-critical DOM cleanup during idle periods.
-     * Removes empty text nodes and detached event listeners
-     * that accumulate over long chat sessions.
+     * Removes empty text nodes that accumulate over long chat sessions.
      */
     _setupIdleCleanup() {
         if (!('requestIdleCallback' in window)) return;
