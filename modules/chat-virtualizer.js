@@ -51,10 +51,12 @@ const DEHYDRATED_ATTR = 'data-perf-dehydrated';
 const HEIGHT_ATTR = 'data-perf-height';
 
 /**
- * Temporary <style> tag ID used to override content-visibility during height reads.
+ * Permanent <style> tag ID that overrides content-visibility:auto for
+ * hydrated messages while the virtualizer is active. This prevents
+ * async reflow from content-visibility:auto which can reset scroll position.
  * @type {string}
  */
-const CV_OVERRIDE_ID = 'perf-cv-override';
+const HYDRATED_OVERRIDE_ID = 'perf-cv-hydrated-override';
 
 export class ChatVirtualizer {
     /**
@@ -94,6 +96,9 @@ export class ChatVirtualizer {
 
         /** @type {number[]} Active scroll-retry timer IDs */
         this._scrollRetryTimers = [];
+
+        /** @type {HTMLStyleElement|null} Permanent content-visibility override */
+        this._hydratedOverrideEl = null;
     }
 
     // ==================================================================
@@ -110,6 +115,7 @@ export class ChatVirtualizer {
             return;
         }
 
+        this._injectHydratedOverride();
         this._setupIntersectionObserver();
         this._setupMutationObserver();
         this._setupScrollTracker();
@@ -150,6 +156,10 @@ export class ChatVirtualizer {
         // Cancel any pending scroll retries
         this._cancelScrollRetries();
 
+        // Remove hydrated override style
+        this._hydratedOverrideEl?.remove();
+        this._hydratedOverrideEl = null;
+
         this._rehydrateAll();
         this._visibleSet.clear();
         this.active = false;
@@ -170,6 +180,45 @@ export class ChatVirtualizer {
     /** Force rehydrate all messages (e.g., before export). */
     rehydrateAll() {
         this._rehydrateAll();
+    }
+
+    /**
+     * Force scroll to the bottom of the chat container.
+     * Public API for use by the orchestrator on chat change events.
+     */
+    scrollToBottom() {
+        this._forceScrollToBottom();
+    }
+
+    // ==================================================================
+    // Content-Visibility Override
+    // ==================================================================
+
+    /**
+     * @private
+     * Inject a permanent style override that sets content-visibility:visible
+     * on hydrated (non-dehydrated) messages. This prevents the browser's
+     * async reflow from content-visibility:auto (in base CSS or other
+     * extensions) which can reset scroll position after scroll-to-bottom.
+     *
+     * When the virtualizer is disabled, this override is removed and
+     * messages revert to default rendering.
+     */
+    _injectHydratedOverride() {
+        let el = document.getElementById(HYDRATED_OVERRIDE_ID);
+        if (!el) {
+            el = document.createElement('style');
+            el.id = HYDRATED_OVERRIDE_ID;
+        }
+        el.textContent = `
+            /* [PerfOptimizer/ChatVirt] Hydrated messages must have stable heights.
+               Prevents content-visibility:auto from causing async reflow. */
+            .mes:not([${DEHYDRATED_ATTR}]) {
+                content-visibility: visible !important;
+            }
+        `;
+        document.head.appendChild(el);
+        this._hydratedOverrideEl = el;
     }
 
     // ==================================================================
@@ -240,33 +289,72 @@ export class ChatVirtualizer {
 
     /** @private */
     _setupMutationObserver() {
-        let pendingCount = 0;
+        let pendingAdded = 0;
+        let removedCount = 0;
 
         this._mutationObserver = new MutationObserver((mutations) => {
             for (const mutation of mutations) {
+                // Detect chat clearing (messages being removed = chat switch)
+                for (const node of mutation.removedNodes) {
+                    if (node.nodeType === Node.ELEMENT_NODE && node.classList?.contains('mes')) {
+                        removedCount++;
+                    }
+                }
                 for (const node of mutation.addedNodes) {
                     if (node.nodeType === Node.ELEMENT_NODE && node.classList?.contains('mes')) {
                         this._observer?.observe(node);
-                        pendingCount++;
+                        pendingAdded++;
                     }
                 }
             }
 
-            if (pendingCount > 0) {
+            if (pendingAdded > 0 || removedCount > 0) {
                 clearTimeout(this._bulkTimer);
-                const count = pendingCount;
+                const addedSnapshot = pendingAdded;
+                const removedSnapshot = removedCount;
                 this._bulkTimer = setTimeout(() => {
-                    if (count >= this.options.bulkLoadThreshold) {
+                    const isChatSwitch = removedSnapshot > 0 && addedSnapshot > 0;
+                    if (isChatSwitch) {
+                        this._onChatSwitch();
+                    } else if (addedSnapshot >= this.options.bulkLoadThreshold) {
                         this._onBulkLoad();
-                    } else {
+                    } else if (addedSnapshot > 0) {
                         this._trimOnNewMessage();
                     }
-                    pendingCount = 0;
+                    pendingAdded = 0;
+                    removedCount = 0;
                 }, 150);
             }
         });
 
         this._mutationObserver.observe(this._chatContainer, { childList: true });
+    }
+
+    /**
+     * @private
+     * Called when a full chat switch is detected (messages removed then new ones added).
+     * Resets virtualizer state and processes the new chat from scratch.
+     */
+    _onChatSwitch() {
+        console.log('[PerfOptimizer/ChatVirt] Chat switch detected, resetting state');
+
+        // Reset state
+        this._visibleSet.clear();
+        this._cancelScrollRetries();
+        clearTimeout(this._dehydrateTimer);
+        this._dehydrateTimer = null;
+        this._processingBulk = false;
+
+        // Reconnect IntersectionObserver for new messages
+        this._observer?.disconnect();
+        this._setupIntersectionObserver();
+
+        // Wait for SillyTavern to finish rendering, then process and scroll
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+                this._processExisting();
+            });
+        });
     }
 
     /**
@@ -364,14 +452,12 @@ export class ChatVirtualizer {
     /**
      * @private
      * Dehydrate all off-screen messages in two phases:
-     *   Phase 0: Override content-visibility:auto to get accurate heights
      *   Phase 1: Batch-read all heights (single forced layout)
      *   Phase 2: Batch-write attributes & styles (no layout triggers)
-     *   Phase 3: Remove override
      *
-     * The content-visibility override is critical: without it, the browser
-     * returns contain-intrinsic-size (200px) instead of real heights for
-     * off-screen messages, causing incorrect scrollHeight after dehydration.
+     * The permanent hydrated override style (_injectHydratedOverride) ensures
+     * that non-dehydrated messages have content-visibility:visible, so
+     * offsetHeight returns REAL rendered heights during Phase 1.
      */
     _bulkDehydrate() {
         if (this._processingBulk) return;
@@ -396,25 +482,13 @@ export class ChatVirtualizer {
 
             if (dehydrateEnd === 0) return;
 
-            // Phase 0: Override content-visibility:auto from CSS & DOM optimizer
-            // so that offsetHeight returns REAL rendered heights, not placeholder
-            // estimates from contain-intrinsic-size.
-            let cvOverride = document.getElementById(CV_OVERRIDE_ID);
-            if (!cvOverride) {
-                cvOverride = document.createElement('style');
-                cvOverride.id = CV_OVERRIDE_ID;
-            }
-            cvOverride.textContent = '.mes:not([data-perf-dehydrated]) { content-visibility: visible !important; }';
-            document.head.appendChild(cvOverride);
-
             // Phase 1: Batch-read heights (forces ONE layout reflow with real heights)
+            // The permanent hydrated override ensures content-visibility:visible
+            // on non-dehydrated messages, so heights are accurate.
             const heights = new Array(dehydrateEnd);
             for (let i = 0; i < dehydrateEnd; i++) {
                 heights[i] = messages[i].offsetHeight;
             }
-
-            // Remove override before writing (dehydrated messages get content-visibility:hidden)
-            cvOverride.remove();
 
             // Phase 2: Batch-write dehydration (pure writes, no layout triggers)
             let dehydratedCount = 0;

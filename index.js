@@ -1093,11 +1093,49 @@ function updateStatus() {
 }
 
 // ===================================================================
+// Chat Change Listener
+// ===================================================================
+
+/**
+ * Register a listener for SillyTavern's CHAT_CHANGED event.
+ * Ensures scroll-to-bottom after chat switches, as a safety net
+ * beyond the ChatVirtualizer's own MutationObserver detection.
+ */
+function registerChatChangeListener() {
+    try {
+        const { eventSource, event_types } = getContext();
+        if (!eventSource || !event_types?.CHAT_CHANGED) {
+            console.warn(`${LOG_PREFIX} CHAT_CHANGED event not available`);
+            return;
+        }
+
+        eventSource.on(event_types.CHAT_CHANGED, () => {
+            // Delay to let SillyTavern finish rendering the new chat
+            setTimeout(() => {
+                if (chatVirtualizer?.active) {
+                    chatVirtualizer.scrollToBottom();
+                } else {
+                    // Even without virtualizer, ensure scroll-to-bottom
+                    const chat = document.getElementById('chat');
+                    if (chat) {
+                        chat.scrollTop = chat.scrollHeight;
+                    }
+                }
+            }, 500);
+        });
+
+        console.log(`${LOG_PREFIX} Registered CHAT_CHANGED listener`);
+    } catch (e) {
+        console.warn(`${LOG_PREFIX} Could not register chat change listener:`, e);
+    }
+}
+
+// ===================================================================
 // Entry Point
 // ===================================================================
 
 jQuery(async () => {
-    console.log(`${LOG_PREFIX} Initializing... [BUILD:20260221e]`);
+    console.log(`${LOG_PREFIX} Initializing... [BUILD:20260221f]`);
 
     try {
         // 1. Load/initialize settings
@@ -1114,6 +1152,9 @@ jQuery(async () => {
 
         // 5. Update status display
         updateStatus();
+
+        // 6. Listen for chat changes to ensure scroll-to-bottom
+        registerChatChangeListener();
 
         console.log(`${LOG_PREFIX} Initialized successfully.`);
     } catch (e) {

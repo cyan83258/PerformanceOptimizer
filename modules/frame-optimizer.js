@@ -121,6 +121,8 @@ export class FrameOptimizer {
      * @private
      * Patch Element.prototype.scrollTo to batch calls within the same frame.
      * SillyTavern sometimes calls scrollTo multiple times in rapid succession.
+     * Scroll-to-bottom operations are executed immediately to prevent
+     * stale scroll positions from interfering with chat virtualization.
      */
     _patchScrollTo() {
         const chat = document.getElementById('chat');
@@ -131,6 +133,18 @@ export class FrameOptimizer {
         let rafId = null;
 
         chat.scrollTo = (...args) => {
+            // Execute scroll-to-bottom immediately to avoid conflicts with
+            // chat virtualizer's dehydration and scroll management.
+            if (this._isScrollToBottom(chat, args)) {
+                if (rafId !== null) {
+                    cancelAnimationFrame(rafId);
+                    rafId = null;
+                }
+                pendingScroll = null;
+                this._originalScrollTo(...args);
+                return;
+            }
+
             pendingScroll = args;
             if (rafId === null) {
                 rafId = requestAnimationFrame(() => {
@@ -142,6 +156,28 @@ export class FrameOptimizer {
                 });
             }
         };
+    }
+
+    /**
+     * @private
+     * Check if scrollTo arguments represent a scroll-to-bottom operation.
+     * @param {HTMLElement} chat
+     * @param {any[]} args
+     * @returns {boolean}
+     */
+    _isScrollToBottom(chat, args) {
+        const maxScroll = chat.scrollHeight - chat.clientHeight;
+        if (maxScroll <= 0) return true;
+
+        let targetTop = null;
+        if (args.length === 1 && typeof args[0] === 'object' && args[0] !== null) {
+            targetTop = args[0].top;
+        } else if (args.length >= 2) {
+            targetTop = args[1];
+        }
+
+        if (targetTop == null) return false;
+        return targetTop >= maxScroll - 100;
     }
 
     /** @private */

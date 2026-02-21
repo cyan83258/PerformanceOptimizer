@@ -17,19 +17,18 @@
 
 /* -------------------------------------------------------------------
  * Message Virtualization
- * Skip rendering of off-screen messages for massive scroll perf gain.
+ * content-visibility for .mes is now managed dynamically by
+ * ChatVirtualizer (when active) to prevent scroll position issues.
+ * When virtualizer is disabled, messages render normally.
+ * See chat-virtualizer.js _injectHydratedOverride().
  * ------------------------------------------------------------------- */
-.mes {
-    content-visibility: auto;
-    contain-intrinsic-size: auto 200px;
-}
 
 /* -------------------------------------------------------------------
  * CSS Containment
  * Isolate layout recalculations to specific subtrees.
  * ------------------------------------------------------------------- */
 #chat {
-    contain: layout style;
+    contain: style;
 }
 
 .completion_prompt_manager_list {
