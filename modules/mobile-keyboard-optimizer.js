@@ -149,12 +149,9 @@ body.${FREEZE_CLASS} .popup-content {
 }
 
 /* Relaxed containment — layout+style only.
-   v3 used "contain: strict" on #sheld which blocked edit UI rendering.
-   v4 uses layout+style which still prevents external reflows but
-   allows internal content (edit textareas) to render properly. */
-body.${FREEZE_CLASS} #sheld {
-    contain: layout style;
-}
+   Only applied to #chat and #form_sheld (the actual chat area).
+   v3/v4.0 applied contain to #sheld which broke drawers/panels
+   opening inside it. v4.1 scopes containment to chat-only elements. */
 body.${FREEZE_CLASS} #chat {
     contain: layout style;
     overflow-anchor: none !important;
@@ -168,6 +165,18 @@ body.${FREEZE_CLASS} .drawer:not(.openDrawer) > .drawer-content,
 body.${FREEZE_CLASS} #right-nav-panel:not(.openDrawer),
 body.${FREEZE_CLASS} #left-nav-panel:not(.openDrawer) {
     content-visibility: hidden !important;
+}
+
+/* Ensure OPEN panels/drawers are NEVER affected by freeze containment.
+   This prevents the "menu closes when tapping input" bug. */
+body.${FREEZE_CLASS} .drawer.openDrawer > .drawer-content,
+body.${FREEZE_CLASS} #right-nav-panel.openDrawer,
+body.${FREEZE_CLASS} #left-nav-panel.openDrawer,
+body.${FREEZE_CLASS} .popup,
+body.${FREEZE_CLASS} .popup-content,
+body.${FREEZE_CLASS} .shadow_popup {
+    contain: none !important;
+    content-visibility: visible !important;
 }
 
 /* Ensure messages being edited can render even during freeze. */
@@ -409,7 +418,14 @@ export class MobileKeyboardOptimizer {
         if (curH !== this._lastH) {
             this._lastH = curH;
 
-            if (!this._frozen) {
+            // CRITICAL: Do NOT freeze if the active element is inside a
+            // settings panel/drawer/popup. Freezing while a panel input has
+            // focus applies containment CSS to #sheld which collapses the
+            // panel and makes it "close" visually.
+            const activeEl = document.activeElement;
+            const inPanel = activeEl && this._isInsidePanel(activeEl);
+
+            if (!this._frozen && !inPanel) {
                 this._freeze('viewport-change');
             }
 

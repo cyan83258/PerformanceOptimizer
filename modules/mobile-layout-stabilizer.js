@@ -181,10 +181,12 @@ export class MobileLayoutStabilizer {
 
     /* ── Sheld container (mobile-styles.css L527-528) ─────────────
        Original: height: calc(100dvh - 36px)
-       Problem:  Main container resizes → chat + input reflow */
+       Problem:  Main container resizes → chat + input reflow
+       NOTE: Do NOT add 'contain' here! #sheld is the parent of all
+       drawers/panels. Containment on #sheld prevents panels from
+       rendering correctly when inputs inside them gain focus. */
     #sheld {
         height: var(--stable-h-36) !important;
-        contain: layout style;
     }
 
     /* ── PWA sheld adjustment ─────────────────────────────────────

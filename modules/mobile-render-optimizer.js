@@ -60,10 +60,9 @@ const OPTIMIZER_CSS = `
     contain-intrinsic-size: 0 0;
 }
 
-/* Container isolation */
-#sheld {
-    contain: layout style;
-}
+/* Container isolation — only apply to elements that don't contain
+   panels/drawers. Do NOT put contain on #sheld as it is the parent
+   of all drawers and containment breaks their internal layout. */
 
 .shadow_popup {
     contain: layout style paint;
@@ -188,14 +187,9 @@ export class MobileRenderOptimizer {
             });
         }
 
-        // Also promote the main container
-        const sheld = document.getElementById('sheld');
-        if (sheld) {
-            sheld.style.transform = 'translateZ(0)';
-            this._cleanups.push(() => {
-                sheld.style.transform = '';
-            });
-        }
+        // NOTE: Do NOT promote #sheld to a GPU layer.
+        // #sheld contains all drawers/panels; forcing a compositing layer
+        // on it wastes GPU memory and can cause rendering issues.
     }
 
     /** @private Remove GPU layer hints. */
@@ -204,10 +198,6 @@ export class MobileRenderOptimizer {
         if (chat) {
             chat.style.willChange = '';
             chat.style.transform = '';
-        }
-        const sheld = document.getElementById('sheld');
-        if (sheld) {
-            sheld.style.transform = '';
         }
     }
 
