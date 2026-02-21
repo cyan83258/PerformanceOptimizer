@@ -1,8 +1,15 @@
 /**
- * Chat Virtualizer Module v2
+ * Chat Virtualizer Module v2.1
  *
  * Virtual scrolling for #chat - only viewport-adjacent messages stay hydrated.
  * Off-screen messages are collapsed to fixed-height placeholders.
+ *
+ * v2.1 fixes over v2:
+ *   - Accurate height reading: temporarily overrides content-visibility:auto
+ *     before reading offsetHeight so off-screen messages report real heights
+ *   - Robust scroll-to-bottom: multiple retry mechanisms to survive async
+ *     layout recalculation and content-visibility reflow
+ *   - Small chat handling: scrolls to bottom even for chats < bulkLoadThreshold
  *
  * v2 improvements over v1:
  *   1. Instant bulk dehydration on chat load
@@ -43,6 +50,12 @@ const DEFAULT_OPTIONS = {
 const DEHYDRATED_ATTR = 'data-perf-dehydrated';
 const HEIGHT_ATTR = 'data-perf-height';
 
+/**
+ * Temporary <style> tag ID used to override content-visibility during height reads.
+ * @type {string}
+ */
+const CV_OVERRIDE_ID = 'perf-cv-override';
+
 export class ChatVirtualizer {
     /**
      * @param {Partial<VirtualizerOptions>} [options]
@@ -78,6 +91,9 @@ export class ChatVirtualizer {
 
         /** @type {boolean} Guard against re-entrant bulk processing */
         this._processingBulk = false;
+
+        /** @type {number[]} Active scroll-retry timer IDs */
+        this._scrollRetryTimers = [];
     }
 
     // ==================================================================
@@ -105,10 +121,10 @@ export class ChatVirtualizer {
         this._initialTimer = setTimeout(() => {
             this._initialTimer = null;
             this._processExisting();
-        }, 1200);
+        }, 1500);
 
         this.active = true;
-        console.log('[PerfOptimizer/ChatVirt] v2 enabled');
+        console.log('[PerfOptimizer/ChatVirt] v2.1 enabled');
     }
 
     /** Disable virtualization and rehydrate all messages. */
@@ -130,6 +146,9 @@ export class ChatVirtualizer {
         this._dehydrateTimer = null;
         this._bulkTimer = null;
         this._initialTimer = null;
+
+        // Cancel any pending scroll retries
+        this._cancelScrollRetries();
 
         this._rehydrateAll();
         this._visibleSet.clear();
@@ -254,18 +273,14 @@ export class ChatVirtualizer {
      * @private
      * Called when a bulk load of messages is detected.
      * Waits two frames for ST's scrollChatToBottom to settle,
-     * then dehydrates and restores scroll position.
+     * then dehydrates and scrolls to bottom.
      */
     _onBulkLoad() {
         if (this._processingBulk) return;
         requestAnimationFrame(() => {
             requestAnimationFrame(() => {
-                const wasAtBottom = this._isAtBottom();
                 this._bulkDehydrate();
-                // Always scroll to bottom after bulk load (chat switch / initial load)
-                this._scrollToBottom();
-                // Double-ensure after content-visibility reflow
-                requestAnimationFrame(() => this._scrollToBottom());
+                this._forceScrollToBottom();
             });
         });
     }
@@ -324,18 +339,21 @@ export class ChatVirtualizer {
     /** @private Handle messages already in the DOM when module enables. */
     _processExisting() {
         const messages = this._chatContainer.querySelectorAll('.mes');
+        console.log(`[PerfOptimizer/ChatVirt] _processExisting: ${messages.length} messages found`);
+
         if (messages.length >= this.options.bulkLoadThreshold) {
             this._bulkDehydrate();
-            // Always scroll to bottom on initial load to match ST's behavior
-            this._scrollToBottom();
-            // Double-ensure after reflow completes
-            requestAnimationFrame(() => this._scrollToBottom());
-        } else {
-            // Small chat: just mark tail as visible
+        } else if (messages.length > 0) {
+            // Small chat: mark tail as visible
             const tailStart = Math.max(0, messages.length - this.options.alwaysVisibleTail);
             for (let i = tailStart; i < messages.length; i++) {
                 this._visibleSet.add(messages[i]);
             }
+        }
+
+        // Always scroll to bottom on initial load to match SillyTavern behavior
+        if (messages.length > 0) {
+            this._forceScrollToBottom();
         }
     }
 
@@ -346,11 +364,14 @@ export class ChatVirtualizer {
     /**
      * @private
      * Dehydrate all off-screen messages in two phases:
+     *   Phase 0: Override content-visibility:auto to get accurate heights
      *   Phase 1: Batch-read all heights (single forced layout)
      *   Phase 2: Batch-write attributes & styles (no layout triggers)
+     *   Phase 3: Remove override
      *
-     * This is drastically faster than the v1 approach of waiting for
-     * IntersectionObserver to gradually dehydrate messages one-by-one.
+     * The content-visibility override is critical: without it, the browser
+     * returns contain-intrinsic-size (200px) instead of real heights for
+     * off-screen messages, causing incorrect scrollHeight after dehydration.
      */
     _bulkDehydrate() {
         if (this._processingBulk) return;
@@ -375,13 +396,28 @@ export class ChatVirtualizer {
 
             if (dehydrateEnd === 0) return;
 
-            // Phase 1: Batch-read heights (one forced layout, no interleaved writes)
+            // Phase 0: Override content-visibility:auto from CSS & DOM optimizer
+            // so that offsetHeight returns REAL rendered heights, not placeholder
+            // estimates from contain-intrinsic-size.
+            let cvOverride = document.getElementById(CV_OVERRIDE_ID);
+            if (!cvOverride) {
+                cvOverride = document.createElement('style');
+                cvOverride.id = CV_OVERRIDE_ID;
+            }
+            cvOverride.textContent = '.mes:not([data-perf-dehydrated]) { content-visibility: visible !important; }';
+            document.head.appendChild(cvOverride);
+
+            // Phase 1: Batch-read heights (forces ONE layout reflow with real heights)
             const heights = new Array(dehydrateEnd);
             for (let i = 0; i < dehydrateEnd; i++) {
                 heights[i] = messages[i].offsetHeight;
             }
 
+            // Remove override before writing (dehydrated messages get content-visibility:hidden)
+            cvOverride.remove();
+
             // Phase 2: Batch-write dehydration (pure writes, no layout triggers)
+            let dehydratedCount = 0;
             for (let i = 0; i < dehydrateEnd; i++) {
                 const mes = messages[i];
                 if (mes.hasAttribute(DEHYDRATED_ATTR)) continue;
@@ -392,6 +428,7 @@ export class ChatVirtualizer {
                 mes.style.minHeight = heights[i] + 'px';
                 mes.style.overflow = 'hidden';
                 mes.style.contentVisibility = 'hidden';
+                dehydratedCount++;
             }
 
             // Update visible set to only include kept messages
@@ -400,7 +437,7 @@ export class ChatVirtualizer {
                 this._visibleSet.add(messages[i]);
             }
 
-            console.log(`[PerfOptimizer/ChatVirt] Bulk dehydrated ${dehydrateEnd}/${total} messages`);
+            console.log(`[PerfOptimizer/ChatVirt] Bulk dehydrated ${dehydratedCount}/${total} messages (kept ${keepCount})`);
         } finally {
             this._processingBulk = false;
         }
@@ -505,5 +542,73 @@ export class ChatVirtualizer {
     _scrollToBottom() {
         if (!this._chatContainer) return;
         this._chatContainer.scrollTop = this._chatContainer.scrollHeight;
+    }
+
+    /**
+     * @private
+     * Cancel all pending scroll retry timers.
+     */
+    _cancelScrollRetries() {
+        for (const id of this._scrollRetryTimers) {
+            clearTimeout(id);
+        }
+        this._scrollRetryTimers = [];
+    }
+
+    /**
+     * @private
+     * Aggressively scroll to the bottom using multiple retry mechanisms.
+     *
+     * After bulk dehydration, content-visibility changes can cause
+     * async layout recalculation. A single scrollTop assignment may not
+     * survive these recalculations. This method retries with multiple
+     * timing strategies to ensure the scroll position sticks.
+     */
+    _forceScrollToBottom() {
+        if (!this._chatContainer) return;
+        this._cancelScrollRetries();
+
+        const doScroll = () => {
+            if (!this._chatContainer) return;
+            this._chatContainer.scrollTop = this._chatContainer.scrollHeight;
+        };
+
+        // Strategy 1: Immediate (handles case where layout is already stable)
+        doScroll();
+
+        // Strategy 2: Microtask (after current JS but before rendering)
+        Promise.resolve().then(doScroll);
+
+        // Strategy 3: Next animation frame (after browser has processed pending styles)
+        requestAnimationFrame(() => {
+            doScroll();
+            // Strategy 4: Frame after that (browser may need 2 frames for content-visibility)
+            requestAnimationFrame(doScroll);
+        });
+
+        // Strategy 5-7: Delayed fallbacks for async content-visibility reflow
+        // content-visibility: hidden -> the browser may defer size recalculation
+        const delays = [50, 200, 500];
+        for (const ms of delays) {
+            const id = setTimeout(() => {
+                doScroll();
+                // Remove this timer from tracking
+                const idx = this._scrollRetryTimers.indexOf(id);
+                if (idx !== -1) this._scrollRetryTimers.splice(idx, 1);
+            }, ms);
+            this._scrollRetryTimers.push(id);
+        }
+
+        // Strategy 8: Use scrollIntoView on the last message as ultimate fallback
+        const lastRetryId = setTimeout(() => {
+            if (!this._chatContainer) return;
+            const lastMes = this._chatContainer.querySelector('.mes:last-child');
+            if (lastMes) {
+                lastMes.scrollIntoView({ block: 'end', behavior: 'instant' });
+            }
+            doScroll(); // One more try after scrollIntoView
+            console.log(`[PerfOptimizer/ChatVirt] forceScrollToBottom complete, scrollTop=${this._chatContainer.scrollTop}, scrollHeight=${this._chatContainer.scrollHeight}`);
+        }, 800);
+        this._scrollRetryTimers.push(lastRetryId);
     }
 }

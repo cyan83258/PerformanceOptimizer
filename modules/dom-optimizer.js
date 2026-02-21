@@ -130,10 +130,9 @@ export class DOMOptimizer {
         if (this._optimizedElements.has(element)) return;
         this._optimizedElements.add(element);
 
-        // Reinforce content-visibility (CSS sets it, but be explicit for dynamically added)
-        if (!element.style.contentVisibility) {
-            element.style.contentVisibility = 'auto';
-            element.style.containIntrinsicSize = 'auto 200px';
-        }
+        // Note: content-visibility is handled by CSS rule in style.css
+        // and managed directly by ChatVirtualizer when active.
+        // Do NOT set inline content-visibility here as it conflicts
+        // with the virtualizer's height reading during bulk dehydration.
     }
 }
