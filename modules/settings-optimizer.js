@@ -35,6 +35,7 @@ export class SettingsOptimizer {
 
     /** Apply optimal settings and start watching for theme overrides. */
     enable() {
+        if (this.active) return;
         this._applySettings();
         this._startWatching();
         this.active = true;
@@ -42,6 +43,8 @@ export class SettingsOptimizer {
 
     /** Stop watching. Applied settings persist (already saved). */
     disable() {
+        clearTimeout(this._reapplyTimer);
+        this._reapplyTimer = null;
         this._stopWatching();
         this.active = false;
     }
@@ -144,7 +147,8 @@ export class SettingsOptimizer {
         this._eventHandler = () => {
             if (this.active) {
                 // Delay slightly to let the theme finish applying its values
-                setTimeout(() => this._applySettings(), 150);
+                clearTimeout(this._reapplyTimer);
+                this._reapplyTimer = setTimeout(() => { if (this.active) this._applySettings(); }, 150);
             }
         };
 

@@ -1,138 +1,85 @@
-/**
- * DOM Optimizer Module
- *
- * Optimizes DOM performance using browser APIs:
- *   - MutationObserver: auto-optimize newly added elements
- *   - Image lazy loading: adds loading="lazy" and decoding="async"
- *   - Content visibility: applies content-visibility to off-screen messages
- *
- * All optimizations are non-destructive and can be disabled cleanly.
- */
-
+/** Batched image hints, scoped to chat. No geometry reads or global rescans. */
 export class DOMOptimizer {
-    constructor() {
-        /** @type {boolean} */
+    constructor({ imageSelector = 'img', marker = 'dom' } = {}) {
+        this._imageSelector = imageSelector;
+        this._marker = marker;
         this.active = false;
-        /** @type {MutationObserver|null} */
         this._mutationObserver = null;
-        /** @type {WeakSet<Element>} Track already-optimized elements */
-        this._optimizedElements = new WeakSet();
+        this._frame = null;
+        this._pending = new Set();
+        this._images = new Set();
     }
 
-    /** Enable DOM optimizations. */
     enable() {
-        this._optimizeExistingElements();
-        this._setupMutationObserver();
+        if (this.active) return;
+        const chat = document.getElementById('chat');
+        if (!chat) return;
         this.active = true;
-    }
-
-    /** Disable DOM optimizations. */
-    disable() {
-        if (this._mutationObserver) {
-            this._mutationObserver.disconnect();
-            this._mutationObserver = null;
-        }
-        this.active = false;
-    }
-
-    /**
-     * @private
-     * Watch for new DOM elements and optimize them automatically.
-     */
-    _setupMutationObserver() {
-        if (this._mutationObserver) {
-            this._mutationObserver.disconnect();
-        }
-
-        let pendingFrame = false;
-        const pendingNodes = [];
-
-        this._mutationObserver = new MutationObserver((mutations) => {
-            // Collect added nodes
-            for (const mutation of mutations) {
-                for (const node of mutation.addedNodes) {
-                    if (node.nodeType === Node.ELEMENT_NODE) {
-                        pendingNodes.push(node);
-                    }
+        this._optimizeElement(chat);
+        this._mutationObserver = new MutationObserver(records => {
+            for (const record of records) {
+                for (const node of record.addedNodes) if (node.nodeType === 1) this._pending.add(node);
+                // Removed images must not be retained across chat changes.
+                for (const node of record.removedNodes) {
+                    if (node.nodeType !== 1) continue;
+                    this._restoreTree(node);
                 }
             }
-
-            // Batch process in a single rAF to avoid layout thrashing
-            if (!pendingFrame && pendingNodes.length > 0) {
-                pendingFrame = true;
-                requestAnimationFrame(() => {
-                    const nodes = pendingNodes.splice(0, pendingNodes.length);
-                    for (const node of nodes) {
-                        this._optimizeElement(node);
-                    }
-                    pendingFrame = false;
-                });
-            }
+            if (this._frame !== null || !this._pending.size) return;
+            this._frame = requestAnimationFrame(() => {
+                this._frame = null;
+                const nodes = this._pending;
+                this._pending = new Set();
+                if (!this.active) return;
+                for (const node of nodes) {
+                    if (!chat.contains(node)) continue;
+                    let parent = node.parentElement;
+                    while (parent && !nodes.has(parent)) parent = parent.parentElement;
+                    if (!parent) this._optimizeElement(node);
+                }
+            });
         });
-
-        // Observe at the highest meaningful level
-        const target = document.getElementById('sheld') || document.body;
-        this._mutationObserver.observe(target, {
-            childList: true,
-            subtree: true,
-        });
+        this._mutationObserver.observe(chat, { childList: true, subtree: true });
     }
 
-    /**
-     * @private
-     * Apply optimizations to all elements currently in the DOM.
-     */
-    _optimizeExistingElements() {
-        // Images: add lazy loading
-        const images = document.querySelectorAll('img:not([loading])');
-        for (const img of images) {
-            img.loading = 'lazy';
-            img.decoding = 'async';
-        }
+    _optimizeElement(node) {
+        if (node.matches('img')) this._image(node);
+        for (const img of node.querySelectorAll('img')) this._image(img);
+    }
 
-        // Messages: ensure content-visibility
-        const messages = document.querySelectorAll('.mes');
-        for (const mes of messages) {
-            this._optimizeMessageElement(mes);
+    _image(img) {
+        if (!img.matches(this._imageSelector)) return;
+        // Record only attributes owned by this module; preserve explicit eager/decoding settings.
+        for (const [name, value] of [['loading', 'lazy'], ['decoding', 'async']]) {
+            if (img.hasAttribute(name)) continue;
+            img.setAttribute(name, value);
+            img.setAttribute(`data-perf-${this._marker}-${name}`, value);
+            this._images.add(img);
         }
     }
 
-    /**
-     * @private
-     * Optimize a single element and relevant children.
-     * @param {Element} element
-     */
-    _optimizeElement(element) {
-        if (this._optimizedElements.has(element)) return;
-        this._optimizedElements.add(element);
-
-        // Message elements
-        if (element.classList?.contains('mes')) {
-            this._optimizeMessageElement(element);
+    _restore(img) {
+        for (const name of ['loading', 'decoding']) {
+            const marker = `data-perf-${this._marker}-${name}`;
+            if (!img.hasAttribute(marker)) continue;
+            if (img.getAttribute(name) === img.getAttribute(marker)) img.removeAttribute(name);
+            img.removeAttribute(marker);
         }
-
-        // Images within the element
-        const images = element.querySelectorAll?.('img:not([loading])');
-        if (images) {
-            for (const img of images) {
-                img.loading = 'lazy';
-                img.decoding = 'async';
-            }
-        }
+        this._images.delete(img);
     }
 
-    /**
-     * @private
-     * Apply message-specific optimizations.
-     * @param {Element} element
-     */
-    _optimizeMessageElement(element) {
-        if (this._optimizedElements.has(element)) return;
-        this._optimizedElements.add(element);
+    _restoreTree(node) {
+        if (this._images.has(node)) this._restore(node);
+        for (const img of node.querySelectorAll(`img[data-perf-${this._marker}-loading], img[data-perf-${this._marker}-decoding]`)) this._restore(img);
+    }
 
-        // Note: content-visibility is handled by CSS rule in style.css
-        // and managed directly by ChatVirtualizer when active.
-        // Do NOT set inline content-visibility here as it conflicts
-        // with the virtualizer's height reading during bulk dehydration.
+    disable() {
+        this.active = false;
+        this._mutationObserver?.disconnect();
+        this._mutationObserver = null;
+        if (this._frame !== null) cancelAnimationFrame(this._frame);
+        this._frame = null;
+        this._pending.clear();
+        for (const img of this._images) this._restore(img);
     }
 }

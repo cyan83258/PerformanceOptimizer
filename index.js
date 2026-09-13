@@ -1,29 +1,4 @@
-/**
- * SillyTavern Performance Optimizer Extension
- *
- * Orchestrates multiple optimization modules to improve UI performance:
- *
- *   - CSS Optimizer:        Disables expensive visual effects (blur, shadow, animations)
- *   - Settings Optimizer:   Applies optimal power_user settings (fast_ui_mode, etc.)
- *   - DOM Optimizer:        Lazy loading, content-visibility, MutationObserver
- *   - Scroll Optimizer:     Scroll containment, prompt manager optimization
- *   - Chat Virtualizer:     Virtual scrolling for chat messages
- *   - Prompt Optimizer:     Debounced prompt manager rendering, sortable throttling
- *   - Background Optimizer: Auto-resize/WebP conversion for background images
- *   - Avatar Cache:         In-memory blob URL caching for avatar images
- *   - Frame Optimizer:      Layout thrashing prevention, DOM read/write batching
- *   - Network Batcher:      GET request caching and deduplication
- *   - Mobile Keyboard:      Prevents layout thrashing on virtual keyboard open/close (v4)
- *   - Mobile Layout:        Stabilizes dvh/vh heights, CSS containment
- *   - Mobile Touch:         Tap delay removal, scroll optimization (v2)
- *   - Mobile Render:        Panel hibernation, GPU promotion, idle cleanup
- *   - Mobile Input:         Edit-mode optimization, textarea resize batching
- *   - Message Content:      CSS containment, lazy images, long message collapsing
- *
- * Each module can be toggled independently from the extension settings panel.
- *
- * @version 4.0.0
- */
+/** Performance Optimizer 4.1.0: native rendering, bounded work and reversible lifecycle. */
 
 const MODULE_NAME = 'SillyTavern-PerformanceOptimizer';
 const LOG_PREFIX = '[PerfOptimizer]';
@@ -153,7 +128,7 @@ let messageContentOptimizer = null;
  */
 function loadSettings() {
     const ctx = getContext();
-    if (!ctx.extensionSettings[MODULE_NAME]) {
+    if (!ctx.extensionSettings[MODULE_NAME] || typeof ctx.extensionSettings[MODULE_NAME] !== 'object' || Array.isArray(ctx.extensionSettings[MODULE_NAME])) {
         ctx.extensionSettings[MODULE_NAME] = structuredClone(DEFAULT_SETTINGS);
         ctx.saveSettingsDebounced();
     } else {
@@ -161,10 +136,10 @@ function loadSettings() {
         const s = ctx.extensionSettings[MODULE_NAME];
         let migrated = false;
         for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
-            if (!(key in s)) {
+            if (!(key in s) || (typeof value === 'object' && (s[key] === null || typeof s[key] !== 'object' || Array.isArray(s[key])))) {
                 s[key] = structuredClone(value);
                 migrated = true;
-            } else if (typeof value === 'object' && value !== null && typeof s[key] === 'object') {
+            } else if (typeof value === 'object' && value !== null && typeof s[key] === 'object' && s[key] !== null && !Array.isArray(s[key])) {
                 // Merge missing sub-keys for existing modules
                 for (const [subKey, subValue] of Object.entries(value)) {
                     if (!(subKey in s[key])) {
@@ -461,6 +436,7 @@ function applyOptimizations() {
     // Message Content Optimizer
     if (messageContentOptimizer) {
         if (settings.messageContent.enabled) {
+            messageContentOptimizer.useBatching = () => Boolean(frameOptimizer?.active);
             messageContentOptimizer.update({
                 collapseThresholdPx: settings.messageContent.collapseThresholdPx,
             });
@@ -589,7 +565,7 @@ function createSettingsPanel() {
                         </label>
                         <input type="checkbox" id="perf_opt_chatvirt" ${checked(settings.chatVirtualizer.enabled)} />
                     </div>
-                    <div class="perf-opt-subtitle">\uD654\uBA74 \uBC16 \uBA54\uC2DC\uC9C0\uB97C \uC228\uACA8 DOM \uBD80\uD558\uB97C \uB300\uD3ED \uC904\uC785\uB2C8\uB2E4</div>
+                    <div class="perf-opt-subtitle">브라우저가 화면 밖 메시지 렌더링을 생략합니다. 검색·선택·편집을 유지하며 읽던 위치를 강제로 이동하지 않습니다.</div>
 
                     <div style="display:flex; flex-direction:column; align-items:stretch; gap:2px; margin:8px 0; padding:4px; border:1px solid rgba(255,255,255,0.1); border-radius:4px;">
                         <small style="opacity:0.8;">\uD56D\uC0C1 \uD65C\uC131 \uBA54\uC2DC\uC9C0 \uC218 (\uD558\uB2E8): <strong id="perf_opt_chatvirt_tail_display">${settings.chatVirtualizer.alwaysVisibleTail}</strong></small>
@@ -612,7 +588,7 @@ function createSettingsPanel() {
                         </label>
                         <input type="checkbox" id="perf_opt_promptopt" ${checked(settings.promptOptimizer.enabled)} />
                     </div>
-                    <div class="perf-opt-subtitle">\uB80C\uB354\uB9C1 \uB514\uBC14\uC6B4\uC2A4 \uBC0F Sortable \uC4F0\uB85C\uD2C0\uB9C1\uC744 \uC801\uC6A9\uD569\uB2C8\uB2E4</div>
+                    <div class="perf-opt-subtitle">화면 밖 프롬프트 렌더링을 줄입니다. 드래그 정렬 초기화는 그대로 유지합니다.</div>
                 </div>
 
                 <!-- Background Optimizer -->
@@ -630,11 +606,11 @@ function createSettingsPanel() {
                 <div class="perf-opt-section" id="perf_opt_avatar_section">
                     <div class="perf-opt-toggle">
                         <label for="perf_opt_avatar">
-                            <b>\u{1F464} \uC544\uBC14\uD0C0 \uCE90\uC2DC</b>
+                            <b>👤 아바타 로딩 최적화</b>
                         </label>
                         <input type="checkbox" id="perf_opt_avatar" ${checked(settings.avatarCache.enabled)} />
                     </div>
-                    <div class="perf-opt-subtitle">\uC544\uBC14\uD0C0 \uC774\uBBF8\uC9C0\uB97C \uBA54\uBAA8\uB9AC\uC5D0 \uCE90\uC2F1\uD558\uC5EC \uC911\uBCF5 \uC694\uCCAD\uC744 \uC81C\uAC70\uD569\uB2C8\uB2E4</div>
+                    <div class="perf-opt-subtitle">브라우저 기본 이미지 캐시를 사용합니다. 추가 다운로드·Blob 복제 없이 아바타 지연 로딩과 비동기 디코딩을 적용합니다.</div>
                 </div>
 
                 <!-- Frame Optimizer -->
@@ -645,7 +621,7 @@ function createSettingsPanel() {
                         </label>
                         <input type="checkbox" id="perf_opt_frame" ${checked(settings.frameOptimizer.enabled)} />
                     </div>
-                    <div class="perf-opt-subtitle">Layout Thrashing \uBC29\uC9C0, DOM \uC77D\uAE30/\uC4F0\uAE30 \uBC30\uCE6D\uC744 \uC218\uD589\uD569\uB2C8\uB2E4</div>
+                    <div class="perf-opt-subtitle">긴 메시지 접기에서 높이 읽기와 화면 변경을 묶습니다. jQuery 측정값과 기본 스크롤은 변경하지 않습니다.</div>
                 </div>
 
                 <!-- Network Batcher -->
@@ -656,7 +632,7 @@ function createSettingsPanel() {
                         </label>
                         <input type="checkbox" id="perf_opt_net" ${checked(settings.networkBatcher.enabled)} />
                     </div>
-                    <div class="perf-opt-subtitle">GET \uC694\uCCAD \uCE90\uC2F1 \uBC0F \uC911\uBCF5 \uC694\uCCAD \uC81C\uAC70\uB97C \uC218\uD589\uD569\uB2C8\uB2E4</div>
+                    <div class="perf-opt-subtitle">같은 서버의 옵션 없는 정적 GET 동시 요청만 합칩니다. 취소·헤더·Request 객체는 그대로 전달하며 응답 캐시는 브라우저에 맡깁니다.</div>
                 </div>
 
 
@@ -702,7 +678,7 @@ function createSettingsPanel() {
                         </label>
                         <input type="checkbox" id="perf_opt_mobilerender" ${checked(settings.mobileRender.enabled)} />
                     </div>
-                    <div class="perf-opt-subtitle">\uD328\uB110 \uD558\uC774\uBC84\uB124\uC774\uC158, GPU \uB808\uC774\uC5B4 \uC2B9\uACA9, \uC720\uD734 \uC2DC DOM \uC815\uB9AC\uB97C \uC218\uD589\uD569\uB2C8\uB2E4</div>
+                    <div class="perf-opt-subtitle">터치 기기의 불필요한 전환 효과를 줄입니다. 공백 텍스트와 GPU 레이어는 강제로 변경하지 않습니다.</div>
                 </div>
 
                 <!-- Mobile Input Optimizer -->
@@ -1098,8 +1074,7 @@ function updateStatus() {
 
 /**
  * Register a listener for SillyTavern's CHAT_CHANGED event.
- * Ensures scroll-to-bottom after chat switches, as a safety net
- * beyond the ChatVirtualizer's own MutationObserver detection.
+ * Resume native rendering after chat changes without moving the reading position.
  */
 function registerChatChangeListener() {
     try {
@@ -1110,18 +1085,7 @@ function registerChatChangeListener() {
         }
 
         eventSource.on(event_types.CHAT_CHANGED, () => {
-            // Delay to let SillyTavern finish rendering the new chat
-            setTimeout(() => {
-                if (chatVirtualizer?.active) {
-                    chatVirtualizer.scrollToBottom();
-                } else {
-                    // Even without virtualizer, ensure scroll-to-bottom
-                    const chat = document.getElementById('chat');
-                    if (chat) {
-                        chat.scrollTop = chat.scrollHeight;
-                    }
-                }
-            }, 500);
+            if (getSettings().enabled) chatVirtualizer?.refresh();
         });
 
         console.log(`${LOG_PREFIX} Registered CHAT_CHANGED listener`);
@@ -1135,7 +1099,7 @@ function registerChatChangeListener() {
 // ===================================================================
 
 jQuery(async () => {
-    console.log(`${LOG_PREFIX} Initializing... [BUILD:20260221f]`);
+    console.log(`${LOG_PREFIX} Initializing... [BUILD:20260913-v4.1.0]`);
 
     try {
         // 1. Load/initialize settings
@@ -1153,7 +1117,7 @@ jQuery(async () => {
         // 5. Update status display
         updateStatus();
 
-        // 6. Listen for chat changes to ensure scroll-to-bottom
+        // 6. Listen for chat changes without taking over scrolling
         registerChatChangeListener();
 
         console.log(`${LOG_PREFIX} Initialized successfully.`);

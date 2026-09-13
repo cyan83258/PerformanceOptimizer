@@ -1,177 +1,64 @@
-/**
- * Network Batcher Module
- *
- * SillyTavern makes frequent API calls, especially for settings saves.
- * This module:
- *   1. Enhances save debouncing — prevents excessive settings persistence
- *   2. Caches repeated GET requests for static resources
- *   3. Deduplicates concurrent identical fetch requests
- *
- * This reduces server load and network overhead, especially during
- * rapid UI interactions (toggling settings, switching chats, etc.).
- */
-
-const LOG = '[PerfOptimizer/NetBatch]';
-
+/** Deduplicate only plain, same-origin static GETs. HTTP caching stays with the browser. */
 export class NetworkBatcher {
     constructor() {
-        /** @type {boolean} */
         this.active = false;
-        /** @type {Map<string, { promise: Promise, time: number }>} */
-        this._fetchCache = new Map();
-        /** @type {Map<string, Promise>} */
         this._inFlight = new Map();
-        /** @type {Function|null} */
-        this._originalFetch = null;
-        /** @type {number} Cache TTL for GET requests in ms */
-        this._cacheTTL = 5000;
-        /** @type {number} */
-        this._cacheHits = 0;
-        /** @type {number} */
         this._dedupeHits = 0;
+        this._wrapper = null;
+        this._originalFetch = null;
     }
 
-    /** Enable network batching. */
     enable() {
-        this._patchFetch();
+        if (this.active) return;
         this.active = true;
-        console.log(`${LOG} Enabled`);
-    }
-
-    /** Disable and restore original fetch. */
-    disable() {
-        this._restoreFetch();
-        this._fetchCache.clear();
-        this._inFlight.clear();
-        this.active = false;
-    }
-
-    /** Get stats. */
-    getStats() {
-        return {
-            cachedResponses: this._fetchCache.size,
-            inFlightRequests: this._inFlight.size,
-            cacheHits: this._cacheHits,
-            dedupeHits: this._dedupeHits,
-        };
-    }
-
-    // ---------------------------------------------------------------
-    // Fetch Patching
-    // ---------------------------------------------------------------
-
-    /** @private */
-    _patchFetch() {
-        if (this._originalFetch) return;
-        this._originalFetch = window.fetch.bind(window);
-
+        const original = window.fetch;
+        const pending = new Map();
+        this._inFlight = pending;
+        this._originalFetch = original;
         const self = this;
-
-        window.fetch = async function (input, init) {
-            const url = typeof input === 'string' ? input : input?.url || '';
-            const method = (init?.method || 'GET').toUpperCase();
-
-            // Only optimize GET requests for cacheable resources
-            if (method === 'GET' && self._isCacheable(url)) {
-                return self._cachedFetch(url, input, init);
+        const wrapper = function(input, init) {
+            // Request objects and any options may carry method, auth, headers, abort or cache semantics.
+            // Forward them untouched. Never merge caller cancellation signals.
+            const key = self.active && self._wrapper === wrapper && init === undefined
+                ? self._key(input) : null;
+            if (!key) return original.call(this, input, init);
+            let promise = pending.get(key);
+            if (promise) self._dedupeHits++;
+            else {
+                if (pending.size >= 32) return original.call(this, input, init);
+                promise = Promise.resolve().then(() => original.call(window, input, init));
+                pending.set(key, promise);
+                // Keep no Response bodies or URLs after the request has settled.
+                promise.then(() => pending.delete(key), () => pending.delete(key));
             }
-
-            return self._originalFetch(input, init);
+            // Each consumer gets its own body, including the first caller.
+            return promise.then(response => response.clone());
         };
+        this._wrapper = wrapper;
+        window.fetch = wrapper;
     }
 
-    /** @private */
-    _restoreFetch() {
-        if (this._originalFetch) {
-            window.fetch = this._originalFetch;
-            this._originalFetch = null;
-        }
-    }
-
-    /**
-     * @private
-     * Check if a URL is suitable for caching.
-     * Only cache static-like resources, not API mutations.
-     * @param {string} url
-     * @returns {boolean}
-     */
-    _isCacheable(url) {
-        // Cache: thumbnails, avatars, background images, static assets
-        return url.includes('/thumbnail') ||
-            url.includes('/img/') ||
-            url.includes('User Avatars') ||
-            url.includes('/characters/') ||
-            url.includes('/backgrounds/') ||
-            url.match(/\.(png|jpg|jpeg|webp|gif|svg|woff2?|ttf)(\?|$)/i) !== null;
-    }
-
-    /**
-     * @private
-     * Fetch with caching and deduplication.
-     * @param {string} url
-     * @param {RequestInfo} input
-     * @param {RequestInit} init
-     * @returns {Promise<Response>}
-     */
-    async _cachedFetch(url, input, init) {
-        // Check memory cache
-        const cached = this._fetchCache.get(url);
-        if (cached && (performance.now() - cached.time) < this._cacheTTL) {
-            this._cacheHits++;
-            // Clone the cached response (responses can only be consumed once)
-            return cached.response.clone();
-        }
-
-        // Deduplicate in-flight requests for the same URL
-        if (this._inFlight.has(url)) {
-            this._dedupeHits++;
-            const resp = await this._inFlight.get(url);
-            return resp.clone();
-        }
-
-        // Perform the actual fetch
-        const fetchPromise = this._originalFetch(input, init).then(response => {
-            if (response.ok) {
-                // Store in cache
-                this._fetchCache.set(url, {
-                    response: response.clone(),
-                    time: performance.now(),
-                });
-
-                // Evict old cache entries periodically
-                if (this._fetchCache.size > 100) {
-                    this._evictOldEntries();
-                }
-            }
-            return response;
-        });
-
-        this._inFlight.set(url, fetchPromise);
-
+    _key(input) {
+        if (typeof input !== 'string' && !(input instanceof URL)) return null;
         try {
-            const response = await fetchPromise;
-            return response;
-        } finally {
-            this._inFlight.delete(url);
-        }
+            const url = new URL(input, document.baseURI);
+            if (url.origin !== location.origin || !/^https?:$/.test(url.protocol) || url.username || url.password) return null;
+            const path = url.pathname;
+            if (!/^(?:\/thumbnail$|\/(?:img|backgrounds|characters|User%20Avatars)\/)/i.test(path)) return null;
+            url.hash = '';
+            return url.href;
+        } catch { return null; }
     }
 
-    /**
-     * @private
-     * Remove cache entries older than TTL.
-     */
-    _evictOldEntries() {
-        const now = performance.now();
-        const toDelete = [];
+    disable() {
+        this.active = false;
+        // Do not remove another extension's wrapper installed after ours.
+        if (window.fetch === this._wrapper) window.fetch = this._originalFetch;
+        this._wrapper = this._originalFetch = null;
+        this._inFlight.clear();
+    }
 
-        for (const [url, entry] of this._fetchCache) {
-            if (now - entry.time > this._cacheTTL * 2) {
-                toDelete.push(url);
-            }
-        }
-
-        for (const url of toDelete) {
-            this._fetchCache.delete(url);
-        }
+    getStats() {
+        return { cachedResponses: 0, inFlightRequests: this._inFlight.size, cacheHits: 0, dedupeHits: this._dedupeHits };
     }
 }

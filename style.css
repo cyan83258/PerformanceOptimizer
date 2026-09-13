@@ -1,53 +1,4 @@
 /* ===================================================================
- * SillyTavern Performance Optimizer - Base Styles
- * Always active when the extension is enabled.
- * Safe CSS containment & rendering hints that improve performance
- * without changing visual appearance.
- * =================================================================== */
-
-/* -------------------------------------------------------------------
- * Chat Virtualizer v2 - CSS-driven dehydration
- * Dehydrated messages have `data-perf-dehydrated` attribute set.
- * This rule hides all children without JS iteration, making
- * bulk dehydration/hydration O(1) per message.
- * ------------------------------------------------------------------- */
-.mes[data-perf-dehydrated] > * {
-    display: none !important;
-}
-
-/* -------------------------------------------------------------------
- * Message Virtualization
- * content-visibility for .mes is now managed dynamically by
- * ChatVirtualizer (when active) to prevent scroll position issues.
- * When virtualizer is disabled, messages render normally.
- * See chat-virtualizer.js _injectHydratedOverride().
- * ------------------------------------------------------------------- */
-
-/* -------------------------------------------------------------------
- * CSS Containment
- * Isolate layout recalculations to specific subtrees.
- * ------------------------------------------------------------------- */
-#chat {
-    contain: style;
-}
-
-.completion_prompt_manager_list {
-    contain: layout style;
-}
-
-/* -------------------------------------------------------------------
- * Scroll Behavior
- * Prevent scroll chaining between nested containers.
- * ------------------------------------------------------------------- */
-#chat,
-.completion_prompt_manager_list,
-#sheld,
-.drawer-content,
-.popup-content {
-    overscroll-behavior: contain;
-}
-
-/* ===================================================================
  * Extension Settings Panel Styles
  * =================================================================== */
 .perf-opt-panel {
@@ -98,20 +49,3 @@
     pointer-events: none;
 }
 
-/* -------------------------------------------------------------------
- * Mobile Keyboard Transition
- * Prevent layout thrashing during keyboard open/close.
- * Active only when body.perf-kb-freeze is set by keyboard optimizer.
- * ------------------------------------------------------------------- */
-@media screen and (max-width: 1000px) {
-    /* Messages being edited must always be fully visible. */
-    .mes[data-perf-editing="1"] {
-        content-visibility: visible !important;
-        contain: none !important;
-    }
-
-    /* Ensure dehydrated children of editing messages still show. */
-    .mes[data-perf-editing="1"][data-perf-dehydrated] > * {
-        display: initial !important;
-    }
-}

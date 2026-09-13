@@ -1,36 +1,4 @@
-/**
- * Mobile Input Optimizer Module
- *
- * Eliminates lag when entering message edit mode and interacting with
- * textareas on mobile devices.
- *
- * Problems addressed:
- *   1. Tapping "edit" on a message causes layout thrashing as the edit
- *      textarea appears and the virtual keyboard opens simultaneously.
- *   2. SillyTavern's textarea auto-resize triggers forced reflows.
- *   3. Programmatic focus calls cause unwanted scroll jumps.
- *   4. Dehydrated messages (from chat virtualizer) can't be edited.
- *
- * Optimizations:
- *   1. Edit Mode Detection
- *      - Detects focus on textareas inside .mes elements
- *      - Marks the message with data-perf-editing for CSS relaxation
- *      - Removes dehydration barriers so edit UI can render
- *
- *   2. Focus Management
- *      - Patches focus() to use preventScroll on textareas
- *      - Prevents browser auto-scroll that causes layout shifts
- *
- *   3. Textarea Resize Batching
- *      - Batches rapid textarea style changes into single rAF
- *      - Reduces layout thrashing during fast typing
- *
- *   4. Edit-Specific CSS
- *      - Relaxes containment on messages being edited
- *      - Ensures content-visibility doesn't block edit textareas
- *
- * @version 1.0.0
- */
+/** Mobile edit containment and focus tracking. Native focus and resizing stay untouched. */
 
 const LOG = '[PerfOpt/InputOpt]';
 const STYLE_ID = 'perf-opt-input-v1';
@@ -48,16 +16,10 @@ export class MobileInputOptimizer {
         /** @type {Function|null} */
         this._onFocusOut = null;
 
-        /** @type {MutationObserver|null} */
-        this._resizeObserver = null;
-        /** @type {MutationObserver|null} */
-        this._chatObserver = null;
 
         /** @type {WeakSet<HTMLElement>} Patched focus elements */
         this._patched = new WeakSet();
 
-        /** @type {number|null} */
-        this._resizeRafId = null;
 
         /** @type {Map<HTMLElement, number>} Edit unmark timers */
         this._unmarkTimers = new Map();
@@ -76,7 +38,7 @@ export class MobileInputOptimizer {
 
         this._injectCSS();
         this._setupEditDetector();
-        this._setupTextareaResizeBatcher();
+        // Native textarea resizing remains synchronous; the old observer only scheduled empty frames.
 
         this.active = true;
         console.log(`${LOG} Enabled`);
@@ -86,8 +48,6 @@ export class MobileInputOptimizer {
         if (!this.active) return;
         this._removeCSS();
         this._removeEditDetector();
-        this._removeTextareaResizeBatcher();
-        this._restoreAllFocus();
         this._clearAllTimers();
         this.active = false;
     }
@@ -172,7 +132,6 @@ export class MobileInputOptimizer {
      * When a textarea inside a message gets focus:
      *   1. Remove dehydration if present (virtualizer)
      *   2. Mark message with EDITING_ATTR for CSS relaxation
-     *   3. Patch focus to use preventScroll
      * When focus leaves:
      *   1. Wait briefly (user might refocus)
      *   2. Unmark message
@@ -181,11 +140,6 @@ export class MobileInputOptimizer {
         this._onFocusIn = (e) => {
             const el = e.target;
             if (!el) return;
-
-            // Patch focus on any textarea to use preventScroll
-            if (el.tagName === 'TEXTAREA') {
-                this._patchFocus(el);
-            }
 
             // Detect edit mode: textarea inside a message element
             if (el.tagName === 'TEXTAREA' || el.isContentEditable) {
@@ -279,129 +233,12 @@ export class MobileInputOptimizer {
             if (activeEl?.closest?.('.mes') === mes) return;
 
             // Check if edit buttons are still visible (edit not yet saved)
-            const editBtns = mes.querySelector('.mes_edit_buttons');
-            if (editBtns && editBtns.style.display !== 'none') return;
+            if (mes.querySelector('.edit_textarea, .reasoning_edit_textarea')) return;
 
             mes.removeAttribute(EDITING_ATTR);
         }, 500);
 
         this._unmarkTimers.set(mes, timer);
-    }
-
-    // ================================================================
-    // Focus Patching (preventScroll)
-    // ================================================================
-
-    /**
-     * @private
-     * Patch an element's focus() to always use preventScroll.
-     * Prevents the browser from auto-scrolling when focusing inputs,
-     * which causes jarring layout shifts on mobile.
-     * @param {HTMLElement} el
-     */
-    _patchFocus(el) {
-        if (this._patched.has(el)) return;
-        this._patched.add(el);
-
-        const orig = el.focus.bind(el);
-        el._origFocus = orig;
-        el.focus = (opts) => {
-            orig({ preventScroll: true, ...opts });
-        };
-    }
-
-    /** @private Restore original focus on known elements. */
-    _restoreAllFocus() {
-        // Restore #send_textarea
-        const send = document.getElementById('send_textarea');
-        if (send?._origFocus) {
-            send.focus = send._origFocus;
-            delete send._origFocus;
-        }
-        // Restore any still-in-DOM edit textareas
-        document.querySelectorAll('.mes textarea').forEach(el => {
-            if (el._origFocus) {
-                el.focus = el._origFocus;
-                delete el._origFocus;
-            }
-        });
-    }
-
-    // ================================================================
-    // Textarea Resize Batching
-    // ================================================================
-
-    /**
-     * @private
-     * SillyTavern sets textarea height via JS on every input event.
-     * Each height change is an inline style mutation that can trigger
-     * a forced reflow if followed by a layout read.
-     *
-     * We observe style mutations on textareas and ensure any pending
-     * layout is batched into a single animation frame, preventing
-     * the read-write-read-write pattern that causes layout thrashing.
-     */
-    _setupTextareaResizeBatcher() {
-        this._resizeObserver = new MutationObserver((mutations) => {
-            for (const m of mutations) {
-                if (m.attributeName !== 'style') continue;
-                if (m.target.tagName !== 'TEXTAREA') continue;
-
-                // Coalesce into a single rAF to batch the layout
-                if (!this._resizeRafId) {
-                    this._resizeRafId = requestAnimationFrame(() => {
-                        this._resizeRafId = null;
-                    });
-                }
-            }
-        });
-
-        // Observe #send_textarea
-        const sendTA = document.getElementById('send_textarea');
-        if (sendTA) {
-            this._resizeObserver.observe(sendTA, {
-                attributes: true,
-                attributeFilter: ['style'],
-            });
-        }
-
-        // Watch for dynamically-added edit textareas in #chat
-        const chat = document.getElementById('chat');
-        if (chat) {
-            this._chatObserver = new MutationObserver((mutations) => {
-                for (const m of mutations) {
-                    for (const node of m.addedNodes) {
-                        if (node.nodeType !== Node.ELEMENT_NODE) continue;
-                        const ta = node.tagName === 'TEXTAREA'
-                            ? node
-                            : node.querySelector?.('textarea');
-                        if (ta) {
-                            this._resizeObserver.observe(ta, {
-                                attributes: true,
-                                attributeFilter: ['style'],
-                            });
-                        }
-                    }
-                }
-            });
-            this._chatObserver.observe(chat, { childList: true, subtree: true });
-        }
-    }
-
-    /** @private */
-    _removeTextareaResizeBatcher() {
-        if (this._resizeObserver) {
-            this._resizeObserver.disconnect();
-            this._resizeObserver = null;
-        }
-        if (this._chatObserver) {
-            this._chatObserver.disconnect();
-            this._chatObserver = null;
-        }
-        if (this._resizeRafId) {
-            cancelAnimationFrame(this._resizeRafId);
-            this._resizeRafId = null;
-        }
     }
 
     // ================================================================

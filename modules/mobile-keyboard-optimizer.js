@@ -243,7 +243,6 @@ export class MobileKeyboardOptimizer {
         this._injectPermanentCSS();
         this._bindFocusEvents();
         this._bindVisualViewport();
-        this._bindResizeGuard();
 
         this.active = true;
         console.log(`${LOG} v4 enabled (viewport: ${this._fullH}px)`);
@@ -356,6 +355,7 @@ export class MobileKeyboardOptimizer {
             // relatedTarget can be null on some mobile browsers.
             // Use rAF as fallback to verify after focusin fires.
             requestAnimationFrame(() => {
+                if (!this.active) return;
                 // Double-check: if activeElement is a keyboard input, skip
                 if (document.activeElement?.matches?.(KB_INPUT)) return;
 
@@ -377,12 +377,7 @@ export class MobileKeyboardOptimizer {
 
     /** @private */
     _bindResizeGuard() {
-        this._onResizeCapture = (e) => {
-            if (this._frozen) {
-                e.stopImmediatePropagation();
-            }
-        };
-        window.addEventListener('resize', this._onResizeCapture, true);
+        // VisualViewport work is batched locally. Do not suppress global resize events.
     }
 
     // ================================================================
@@ -479,6 +474,7 @@ export class MobileKeyboardOptimizer {
     _onStable() {
         this._saveScrollPos();
         requestAnimationFrame(() => {
+            if (!this.active) return;
             this._unfreeze();
             this._restoreScrollPos();
         });

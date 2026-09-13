@@ -17,6 +17,8 @@ export class BackgroundOptimizer {
     constructor() {
         /** @type {boolean} */
         this.active = false;
+        this._generation = 0;
+        this._timer = null;
         /** @type {MutationObserver|null} */
         this._bgObserver = null;
         /** @type {Map<string, string>} url -> optimized blob URL */
@@ -29,6 +31,8 @@ export class BackgroundOptimizer {
 
     /** Enable background optimization. */
     enable() {
+        if (this.active) return;
+        this.active = true;
         this._observeBackground();
         // Process current background immediately
         this._processCurrentBackground();
@@ -38,6 +42,10 @@ export class BackgroundOptimizer {
 
     /** Disable and clean up cached blob URLs. */
     disable() {
+        this.active = false;
+        this._generation++;
+        clearTimeout(this._timer);
+        this._timer = null;
         if (this._bgObserver) {
             this._bgObserver.disconnect();
             this._bgObserver = null;
@@ -63,7 +71,8 @@ export class BackgroundOptimizer {
             for (const mutation of mutations) {
                 if (mutation.type === 'attributes' && mutation.attributeName === 'style') {
                     // Delay slightly to let SillyTavern finish setting the background
-                    setTimeout(() => this._processCurrentBackground(), 100);
+                    clearTimeout(this._timer);
+                    this._timer = setTimeout(() => this._processCurrentBackground(), 100);
                 }
             }
         });
@@ -80,7 +89,7 @@ export class BackgroundOptimizer {
 
     /** @private Process the current background image */
     async _processCurrentBackground() {
-        if (this._processing) return;
+        if (!this.active || this._processing) return;
 
         const bg1 = document.getElementById('bg1');
         if (!bg1) return;
@@ -95,34 +104,47 @@ export class BackgroundOptimizer {
         const originalUrl = urlMatch[1];
 
         // Skip already-optimized blob URLs
-        if (originalUrl.startsWith('blob:')) return;
+        if (originalUrl.startsWith('blob:') || /\.(gif|webp|apng)(?:[?#]|$)/i.test(originalUrl)) return;
 
         // Check cache
         if (this._cache.has(originalUrl)) {
             const cachedUrl = this._cache.get(originalUrl);
+            bg1.dataset.perfOriginalBg = bgImage;
             bg1.style.backgroundImage = `url("${cachedUrl}")`;
             this._currentBlobUrl = cachedUrl;
             return;
         }
 
         this._processing = true;
+        const generation = this._generation;
 
         try {
             const optimizedUrl = await this._optimizeImage(originalUrl);
-            if (optimizedUrl && this.active) {
+            if (optimizedUrl && (!this.active || generation !== this._generation || bg1.style.backgroundImage !== bgImage)) {
+                URL.revokeObjectURL(optimizedUrl);
+                return;
+            }
+            if (optimizedUrl) {
                 this._cache.set(originalUrl, optimizedUrl);
                 // Store original URL for restoration
-                if (!bg1.dataset.perfOriginalBg) {
-                    bg1.dataset.perfOriginalBg = bgImage;
-                }
+                bg1.dataset.perfOriginalBg = bgImage;
                 bg1.style.backgroundImage = `url("${optimizedUrl}")`;
                 this._currentBlobUrl = optimizedUrl;
+                while (this._cache.size > 4) {
+                    const [key, blob] = this._cache.entries().next().value;
+                    URL.revokeObjectURL(blob);
+                    this._cache.delete(key);
+                }
                 console.log(`${LOG} Background optimized`);
             }
         } catch (e) {
             console.warn(`${LOG} Failed to optimize background:`, e);
         } finally {
             this._processing = false;
+            if (this.active && bg1.style.backgroundImage !== bgImage) {
+                clearTimeout(this._timer);
+                this._timer = setTimeout(() => this._processCurrentBackground(), 100);
+            }
         }
     }
 
@@ -152,6 +174,7 @@ export class BackgroundOptimizer {
             targetWidth / img.naturalWidth,
             targetHeight / img.naturalHeight,
         );
+        if (scale >= 0.95) return null;
         const newWidth = Math.round(img.naturalWidth * scale);
         const newHeight = Math.round(img.naturalHeight * scale);
 
@@ -175,7 +198,7 @@ export class BackgroundOptimizer {
 
         if (!blob) return null;
 
-        const originalSize = await this._estimateOriginalSize(url);
+        const originalSize = 0; // No extra HEAD request solely for a log message.
         const newSize = blob.size;
         const savings = originalSize > 0
             ? `${Math.round((1 - newSize / originalSize) * 100)}% smaller`
@@ -224,7 +247,9 @@ export class BackgroundOptimizer {
     _restoreOriginalBackground() {
         const bg1 = document.getElementById('bg1');
         if (bg1 && bg1.dataset.perfOriginalBg) {
-            bg1.style.backgroundImage = bg1.dataset.perfOriginalBg;
+            if (this._currentBlobUrl && bg1.style.backgroundImage.includes(this._currentBlobUrl)) {
+                bg1.style.backgroundImage = bg1.dataset.perfOriginalBg;
+            }
             delete bg1.dataset.perfOriginalBg;
         }
     }

@@ -1,332 +1,153 @@
-/**
- * Message Content Optimizer Module v1
- *
- * Reduces rendering cost of visible (hydrated) messages:
- *
- *   1. CSS Containment
- *      - `contain: layout style` on .mes isolates each message's layout
- *      - Changes inside one message don't trigger reflow of siblings
- *
- *   2. Lazy Image Loading
- *      - `loading="lazy"` + `decoding="async"` on images in .mes_text
- *      - Off-screen images don't block the main thread
- *
- *   3. Long Message Collapsing
- *      - Messages taller than collapseThresholdPx are truncated with
- *        a gradient mask and toggle button (펼치기/접기)
- *      - Dramatically reduces layout/paint area for 20k+ token messages
- *
- * Integrations:
- *   - Automatically processes newly added messages (MutationObserver)
- *   - Detects virtualizer rehydration events and processes restored messages
- *   - Skips dehydrated messages (heights unreliable when children hidden)
- *
- * @version 1.0.0
- */
+import { DOMScheduler } from './frame-optimizer.js';
+const BUTTON = 'perf-collapse-toggle';
+const ATTR = 'data-perf-collapsed';
 
-const COLLAPSED_ATTR = 'data-perf-collapsed';
-const COLLAPSE_BTN_CLASS = 'perf-collapse-toggle';
-
-const DEFAULT_OPTIONS = {
-    /** Apply CSS containment to .mes elements */
-    containment: true,
-    /** Convert images to lazy loading */
-    lazyImages: true,
-    /** Collapse messages taller than this (px). 0 = disabled */
-    collapseThresholdPx: 600,
-};
-
+/** Only measure visible, completed messages. Native virtualization handles the rest. */
 export class MessageContentOptimizer {
-    /**
-     * @param {Partial<typeof DEFAULT_OPTIONS>} [options]
-     */
-    constructor(options) {
-        /** @type {boolean} */
+    constructor(options = {}) {
         this.active = false;
-        this.options = { ...DEFAULT_OPTIONS, ...options };
-
-        /** @type {HTMLStyleElement|null} */
-        this._styleEl = null;
-        /** @type {MutationObserver|null} */
-        this._childObserver = null;
-        /** @type {MutationObserver|null} */
-        this._rehydrateObserver = null;
-        /** @type {HTMLElement|null} */
+        this.options = { collapseThresholdPx: 600, ...options };
+        this._scheduler = new DOMScheduler();
+        this._pending = new Set();
+        this._visible = new Set();
+        this._queued = false;
+        this._generation = 0;
         this._chatContainer = null;
+        this._observer = null;
+        this._mutations = null;
+        this._styleEl = null;
+        this.useBatching = () => true;
     }
-
-    // ==================================================================
-    // Public API
-    // ==================================================================
-
     enable() {
         if (this.active) return;
-
-        this._chatContainer = document.getElementById('chat');
-        if (!this._chatContainer) {
-            console.warn('[PerfOptimizer/MsgContent] #chat not found');
-            return;
-        }
-
-        this._injectStyles();
-        this._processAllMessages();
-        this._setupObservers();
-
+        const chat = document.getElementById('chat');
+        if (!chat) return;
+        this._chatContainer = chat;
         this.active = true;
-        console.log('[PerfOptimizer/MsgContent] v1 enabled');
-    }
-
-    disable() {
-        this.active = false;
-
-        this._childObserver?.disconnect();
-        this._childObserver = null;
-        this._rehydrateObserver?.disconnect();
-        this._rehydrateObserver = null;
-
-        this._removeStyles();
-        this._uncollapseAll();
-        this._restoreLazyImages();
-
-        this._chatContainer = null;
-    }
-
-    /**
-     * Update options at runtime.
-     * @param {Partial<typeof DEFAULT_OPTIONS>} options
-     */
-    update(options) {
-        this.options = { ...this.options, ...options };
-        if (this.active) {
-            this.disable();
-            this.enable();
-        }
-    }
-
-    // ==================================================================
-    // CSS Containment & Styles
-    // ==================================================================
-
-    /** @private */
-    _injectStyles() {
-        // Remove old style if re-enabling
-        document.getElementById('perf-msg-content-optimizer')?.remove();
-
         this._styleEl = document.createElement('style');
-        this._styleEl.id = 'perf-msg-content-optimizer';
-
-        const rules = [];
-
-        if (this.options.containment) {
-            rules.push(`
-                #chat .mes {
-                    contain: style;
-                }
-                #chat .mes .mes_text {
-                    contain: style;
-                }
-            `);
-        }
-
-        if (this.options.collapseThresholdPx > 0) {
-            rules.push(`
-                #chat .mes[${COLLAPSED_ATTR}] .mes_text {
-                    max-height: ${this.options.collapseThresholdPx}px !important;
-                    overflow: hidden !important;
-                    -webkit-mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
-                    mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
-                }
-                .${COLLAPSE_BTN_CLASS} {
-                    display: block;
-                    width: 100%;
-                    padding: 8px 0;
-                    margin-top: 2px;
-                    border: 1px solid rgba(255,255,255,0.15);
-                    background: rgba(128,128,128,0.15);
-                    color: var(--SmartThemeEmColor, #ccc);
-                    font-size: 0.85em;
-                    cursor: pointer;
-                    border-radius: 4px;
-                    text-align: center;
-                    opacity: 0.85;
-                    transition: opacity 0.15s;
-                }
-                .${COLLAPSE_BTN_CLASS}:hover {
-                    opacity: 1;
-                    background: rgba(128,128,128,0.25);
-                }
-            `);
-        }
-
-        this._styleEl.textContent = rules.join('\n');
-        document.head.appendChild(this._styleEl);
-    }
-
-    /** @private */
-    _removeStyles() {
-        this._styleEl?.remove();
-        this._styleEl = null;
-    }
-
-    // ==================================================================
-    // Message Processing
-    // ==================================================================
-
-    /** @private Process all existing non-dehydrated messages. */
-    _processAllMessages() {
-        if (!this._chatContainer) return;
-        for (const mes of this._chatContainer.querySelectorAll('.mes:not([data-perf-dehydrated])')) {
-            this._processMessage(mes);
-        }
-    }
-
-    /**
-     * @private
-     * Process a single message: lazy images + collapse check.
-     * Skips dehydrated messages (children hidden, heights unreliable).
-     * @param {HTMLElement} mes
-     */
-    _processMessage(mes) {
-        if (mes.hasAttribute('data-perf-dehydrated')) return;
-
-        if (this.options.lazyImages) {
-            this._applyLazyImages(mes);
-        }
-        if (this.options.collapseThresholdPx > 0) {
-            this._collapseIfLong(mes);
-        }
-    }
-
-    // ==================================================================
-    // Lazy Images
-    // ==================================================================
-
-    /** @private */
-    _applyLazyImages(mes) {
-        const mesText = mes.querySelector('.mes_text');
-        if (!mesText) return;
-
-        for (const img of mesText.querySelectorAll('img:not([loading="lazy"])')) {
-            img.loading = 'lazy';
-            img.decoding = 'async';
-        }
-    }
-
-    /** @private */
-    _restoreLazyImages() {
-        if (!this._chatContainer) return;
-        for (const img of this._chatContainer.querySelectorAll('.mes_text img[loading="lazy"]')) {
-            img.removeAttribute('loading');
-            img.removeAttribute('decoding');
-        }
-    }
-
-    // ==================================================================
-    // Long Message Collapsing
-    // ==================================================================
-
-    /**
-     * @private
-     * Collapse a message if its text content exceeds the threshold.
-     * Respects user expand/collapse choices — once expanded, stays expanded.
-     * @param {HTMLElement} mes
-     */
-    _collapseIfLong(mes) {
-        // Skip if already collapsed or user already expanded (button exists)
-        if (mes.hasAttribute(COLLAPSED_ATTR)) return;
-        if (mes.querySelector(`.${COLLAPSE_BTN_CLASS}`)) return;
-        // Skip if being edited
-        if (mes.querySelector('.mes_edit_buttons:not([style*="display: none"])')) return;
-
-        const mesText = mes.querySelector('.mes_text');
-        if (!mesText) return;
-
-        const naturalHeight = mesText.scrollHeight;
-        if (naturalHeight <= this.options.collapseThresholdPx) return;
-
-        // Mark collapsed
-        mes.setAttribute(COLLAPSED_ATTR, '1');
-
-        // Create toggle button
-        const btn = document.createElement('button');
-        btn.className = COLLAPSE_BTN_CLASS;
-        const ratio = Math.round(naturalHeight / this.options.collapseThresholdPx);
-        btn.textContent = `\u25BC \uD3BC\uCE58\uAE30 (${ratio}x \uAE38\uC774)`;
-        btn.addEventListener('click', () => this._toggleCollapse(mes, btn));
-
-        // Insert after .mes_text
-        mesText.parentNode.insertBefore(btn, mesText.nextSibling);
-    }
-
-    /**
-     * @private
-     * Toggle collapse/expand state on a message.
-     * @param {HTMLElement} mes
-     * @param {HTMLButtonElement} btn
-     */
-    _toggleCollapse(mes, btn) {
-        if (mes.hasAttribute(COLLAPSED_ATTR)) {
-            mes.removeAttribute(COLLAPSED_ATTR);
-            btn.textContent = '\u25B2 \uC811\uAE30';
-        } else {
-            mes.setAttribute(COLLAPSED_ATTR, '1');
-            const mesText = mes.querySelector('.mes_text');
-            if (mesText) {
-                const ratio = Math.round(mesText.scrollHeight / this.options.collapseThresholdPx);
-                btn.textContent = `\u25BC \uD3BC\uCE58\uAE30 (${ratio}x \uAE38\uC774)`;
+        this._styleEl.textContent = `
+            #chat > .mes { contain: style; }
+            #chat > .mes[${ATTR}]:not(.last_mes):not(:has(.edit_textarea, .reasoning_edit_textarea)) .mes_text {
+                max-height: ${this.options.collapseThresholdPx}px !important;
+                overflow: hidden !important;
             }
-        }
-    }
-
-    /** @private Remove all collapse state and buttons. */
-    _uncollapseAll() {
-        if (!this._chatContainer) return;
-        for (const mes of this._chatContainer.querySelectorAll(`[${COLLAPSED_ATTR}]`)) {
-            mes.removeAttribute(COLLAPSED_ATTR);
-        }
-        for (const btn of this._chatContainer.querySelectorAll(`.${COLLAPSE_BTN_CLASS}`)) {
-            btn.remove();
-        }
-    }
-
-    // ==================================================================
-    // Observers
-    // ==================================================================
-
-    /** @private */
-    _setupObservers() {
-        // Observer 1: New .mes elements added to #chat (direct children)
-        this._childObserver = new MutationObserver((mutations) => {
-            for (const mutation of mutations) {
-                for (const node of mutation.addedNodes) {
-                    if (node.nodeType === Node.ELEMENT_NODE && node.classList?.contains('mes')) {
-                        // Delay one frame so SillyTavern populates message content
-                        requestAnimationFrame(() => {
-                            if (this.active) this._processMessage(node);
-                        });
+            #chat .${BUTTON} {
+                display: block; width: 100%; padding: 8px; margin-top: 4px;
+                color: inherit; background: var(--SmartThemeBlurTintColor, #333);
+                border: 1px solid var(--SmartThemeBorderColor, #888); border-radius: 4px; cursor: pointer;
+            }
+        `;
+        document.head.appendChild(this._styleEl);
+        if (this.options.collapseThresholdPx <= 0 || typeof IntersectionObserver !== 'function') return;
+        this._observer = new IntersectionObserver(entries => {
+            if (!this.active) return;
+            for (const { target, isIntersecting } of entries) {
+                if (target.parentElement !== chat) continue;
+                if (isIntersecting) { this._visible.add(target); this._queue(target); }
+                else this._visible.delete(target);
+            }
+        }, { root: chat });
+        for (const mes of chat.children) if (mes.matches('.mes')) this._observer.observe(mes);
+        this._mutations = new MutationObserver(records => {
+            for (const record of records) {
+                if (record.target === chat && record.type === 'childList') {
+                    for (const node of record.removedNodes) {
+                        if (node.nodeType !== 1) continue;
+                        this._observer.unobserve(node);
+                        this._visible.delete(node);
+                        this._pending.delete(node);
+                        this._reset(node);
+                    }
+                    for (const node of record.addedNodes) {
+                        if (node.nodeType === 1 && node.matches('.mes')) this._observer.observe(node);
                     }
                 }
+                const element = record.target.nodeType === 1 ? record.target : record.target.parentElement;
+                const mes = element?.closest('.mes');
+                if (mes && this._visible.has(mes)) this._queue(mes);
             }
         });
-        this._childObserver.observe(this._chatContainer, { childList: true });
-
-        // Observer 2: Detect when virtualizer rehydrates messages
-        // (data-perf-dehydrated removed → process the restored message)
-        this._rehydrateObserver = new MutationObserver((mutations) => {
-            for (const mutation of mutations) {
-                const mes = mutation.target;
-                if (!mes.classList?.contains('mes')) continue;
-                if (mes.hasAttribute('data-perf-dehydrated')) continue;
-                // Message just rehydrated — process it
-                requestAnimationFrame(() => {
-                    if (this.active) this._processMessage(mes);
-                });
+        this._mutations.observe(chat, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['class'] });
+        this._onLoad = event => {
+            const mes = event.target.closest?.('.mes');
+            if (this._visible.has(mes)) this._queue(mes);
+        };
+        chat.addEventListener('load', this._onLoad, true);
+    }
+    _queue(mes) {
+        if (mes.classList.contains('last_mes')) return;
+        this._pending.add(mes);
+        if (this._queued) return;
+        this._queued = true;
+        const generation = this._generation;
+        this._scheduler.read(() => {
+            this._queued = false;
+            const pending = [...this._pending];
+            this._pending.clear();
+            if (!this.active || generation !== this._generation) return;
+            const measurements = [];
+            for (const node of pending) {
+                if (!this._eligible(node)) continue;
+                const height = node.querySelector('.mes_text')?.scrollHeight || 0;
+                if (height > this.options.collapseThresholdPx) {
+                    if (this.useBatching()) measurements.push([node, height]);
+                    else this._collapse(node, height);
+                }
             }
+            if (measurements.length) this._scheduler.write(() => {
+                if (!this.active || generation !== this._generation) return;
+                for (const [node, height] of measurements) if (this._eligible(node)) this._collapse(node, height);
+            });
         });
-        this._rehydrateObserver.observe(this._chatContainer, {
-            attributes: true,
-            attributeFilter: ['data-perf-dehydrated'],
-            subtree: true,
+    }
+    _eligible(mes) {
+        return mes.parentElement === this._chatContainer && this._visible.has(mes)
+            && !mes.classList.contains('last_mes') && !mes.matches(':focus-within')
+            && !mes.querySelector(`.${BUTTON}, .edit_textarea, .reasoning_edit_textarea`);
+    }
+    _collapse(mes, height) {
+        const text = mes.querySelector('.mes_text');
+        if (!text) return;
+        mes.setAttribute(ATTR, '1');
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = BUTTON;
+        button.textContent = `▼ 펼치기 (${Math.round(height / this.options.collapseThresholdPx)}× 길이)`;
+        button.setAttribute('aria-expanded', 'false');
+        button.addEventListener('click', () => {
+            const collapsed = mes.toggleAttribute(ATTR);
+            button.textContent = collapsed ? '▼ 펼치기' : '▲ 접기';
+            button.setAttribute('aria-expanded', String(!collapsed));
         });
+        text.after(button);
+    }
+    _reset(mes) {
+        mes.removeAttribute(ATTR);
+        mes.querySelectorAll(`.${BUTTON}`).forEach(button => button.remove());
+    }
+    disable() {
+        this.active = false;
+        this._generation++;
+        this._observer?.disconnect();
+        this._mutations?.disconnect();
+        this._observer = this._mutations = null;
+        this._scheduler.clear();
+        this._pending.clear();
+        this._visible.clear();
+        this._queued = false;
+        if (this._onLoad) this._chatContainer?.removeEventListener('load', this._onLoad, true);
+        this._onLoad = null;
+        for (const mes of this._chatContainer?.querySelectorAll('.mes') || []) this._reset(mes);
+        this._styleEl?.remove();
+        this._styleEl = this._chatContainer = null;
+    }
+    update(options) {
+        const number = Number(options.collapseThresholdPx ?? this.options.collapseThresholdPx);
+        const threshold = Number.isFinite(number) ? Math.min(10000, Math.max(0, number)) : 600;
+        if (threshold === this.options.collapseThresholdPx) return;
+        const active = this.active;
+        if (active) this.disable();
+        this.options.collapseThresholdPx = threshold;
+        if (active) this.enable();
     }
 }
