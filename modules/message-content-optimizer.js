@@ -27,7 +27,7 @@ export class MessageContentOptimizer {
         this._styleEl = document.createElement('style');
         this._styleEl.textContent = `
             #chat > .mes { contain: style; }
-            #chat > .mes[${ATTR}]:not(.last_mes):not(:has(.edit_textarea, .reasoning_edit_textarea)) .mes_text {
+            #chat > .mes[${ATTR}]:not(:has(.edit_textarea, .reasoning_edit_textarea)) .mes_text {
                 max-height: ${this.options.collapseThresholdPx}px !important;
                 overflow: hidden !important;
             }
