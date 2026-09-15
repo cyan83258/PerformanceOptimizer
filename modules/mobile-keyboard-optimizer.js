@@ -153,11 +153,11 @@ body.${FREEZE_CLASS} .popup-content {
    v3/v4.0 applied contain to #sheld which broke drawers/panels
    opening inside it. v4.1 scopes containment to chat-only elements. */
 body.${FREEZE_CLASS} #chat {
-    contain: layout style;
-    overflow-anchor: none !important;
+    contain: style;
+    /* Keep browser anchoring active while message heights change. */
 }
 body.${FREEZE_CLASS} #form_sheld {
-    contain: layout style;
+    contain: style;
 }
 
 /* Hide closed panels entirely during transition. */
@@ -469,14 +469,12 @@ export class MobileKeyboardOptimizer {
     /**
      * @private
      * v4: Single-frame unfreeze (v3 used nested double rAF = 2 extra frames).
-     * Save scroll → unfreeze → restore scroll in one rAF.
+     * Unfreeze without restoring stale absolute scroll coordinates.
      */
     _onStable() {
-        this._saveScrollPos();
         requestAnimationFrame(() => {
             if (!this.active) return;
             this._unfreeze();
-            this._restoreScrollPos();
         });
     }
 
@@ -489,7 +487,6 @@ export class MobileKeyboardOptimizer {
         if (this._frozen) return;
         this._frozen = true;
 
-        this._saveScrollPos();
 
         // Toggle class — CSS rules activate instantly, zero inject overhead
         document.body?.classList.add(FREEZE_CLASS);
@@ -524,20 +521,6 @@ export class MobileKeyboardOptimizer {
     // ================================================================
     // Scroll Position Preservation
     // ================================================================
-
-    /** @private */
-    _saveScrollPos() {
-        const chat = document.getElementById('chat');
-        if (chat) this._scrollPos = chat.scrollTop;
-    }
-
-    /** @private */
-    _restoreScrollPos() {
-        const chat = document.getElementById('chat');
-        if (chat && this._scrollPos > 0) {
-            chat.scrollTop = this._scrollPos;
-        }
-    }
 
     // ================================================================
     // Layer 3 — Permanent CSS (class-toggled)

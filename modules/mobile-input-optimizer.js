@@ -1,3 +1,4 @@
+import { MessageScrollAnchor } from './message-scroll-anchor.js';
 /** Mobile edit containment and focus tracking. Native focus and resizing stay untouched. */
 
 const LOG = '[PerfOpt/InputOpt]';
@@ -7,6 +8,7 @@ const EDITING_ATTR = 'data-perf-editing';
 export class MobileInputOptimizer {
     constructor() {
         this.active = false;
+        this._scrollAnchor = new MessageScrollAnchor();
 
         /** @type {HTMLStyleElement|null} */
         this._styleEl = null;
@@ -38,6 +40,7 @@ export class MobileInputOptimizer {
 
         this._injectCSS();
         this._setupEditDetector();
+        this._scrollAnchor.enable();
         // Native textarea resizing remains synchronous; the old observer only scheduled empty frames.
 
         this.active = true;
@@ -48,6 +51,7 @@ export class MobileInputOptimizer {
         if (!this.active) return;
         this._removeCSS();
         this._removeEditDetector();
+        this._scrollAnchor.disable();
         this._clearAllTimers();
         this.active = false;
     }
